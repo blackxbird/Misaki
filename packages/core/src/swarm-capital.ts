@@ -43,6 +43,7 @@ import {
 } from "./swarm.js";
 import { readUsdcBalance } from "./sweep.js";
 import { assertSwarmWorkersStopped } from "./swarm-workers.js";
+import { dissolutionSwarm } from "./swarm-dissolution.js";
 import {
   transferBetweenAccounts,
   TransferError,
@@ -1118,6 +1119,7 @@ async function dissolveSwarmLocked(
         {
           reason: "sweep",
           from: memberLegs[0]!.from,
+          dissolution: swarm.name,
           treasury: swarm.treasury.account,
           network: swarm.network,
           legs: memberLegs,
@@ -1148,6 +1150,7 @@ async function dissolveSwarmLocked(
         {
           reason: "sweep",
           from: swarm.treasury.account,
+          dissolution: swarm.name,
           treasury: swarm.treasury.account,
           network: swarm.network,
           legs: [{ to: "owner", amountUsd: formatUsdCents(treasuryCents), purpose: "sweep" }],
@@ -1770,6 +1773,8 @@ async function resumeOrBlock(
   const resumable = movements.resumable[0];
   if (resumable === undefined) return undefined;
   const movement = await readMovement(home, resumable.id);
+  if (await dissolutionSwarm(home, movement))
+    await deps.reconcileRuns?.({ home, name: swarm.name });
   return movementResult(
     resumable.id === swarm.setupFunding?.policy?.movementId
       ? await resumeSetupPolicyMovement(movement, deps, home)
@@ -1789,6 +1794,8 @@ async function resumeOrBlockOther(
   if (blocking !== undefined) throw unfinishedMovementError(swarm, blocking.id);
   const resumable = movements.resumable.find((movement) => !recordedIds.has(movement.id));
   if (resumable === undefined) return undefined;
+  if (await dissolutionSwarm(home, await readMovement(home, resumable.id)))
+    await deps.reconcileRuns?.({ home, name: swarm.name });
   return movementResult(
     await executeMovement({ resume: resumable.id }, movementDeps(deps, home)),
     true,

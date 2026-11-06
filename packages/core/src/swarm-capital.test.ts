@@ -9,7 +9,7 @@ import type { DeviceLinkStart } from "./agent-link.js";
 import { readAgentProfile } from "./agent-profile.js";
 import { parseUsdCents } from "./allocation.js";
 import { exportBackupSource, restoreFromBackup, type BackupPlaintextV2 } from "./backup.js";
-import { readMovement } from "./movement.js";
+import { executeMovement, readMovement } from "./movement.js";
 import { memorySecretStore, type SecretStore } from "./secret-store.js";
 import {
   dissolveSwarm,
@@ -1368,6 +1368,47 @@ describe("leaving a swarm", () => {
 });
 
 describe("dissolving a swarm", () => {
+  it.each(
+    (["fund", "setup-fund", "rebalance", "leave", "executor"] as const).flatMap((command) => [
+      { command, sender: "team-treasury" },
+      { command, sender: "team-lead-1" },
+    ]),
+  )(
+    "guards an incomplete $sender dissolution resumed through $command",
+    async ({ command, sender }) => {
+      const fixture = await capitalFixture();
+      fixture.balances.set(sender, 1_000_000n);
+      fixture.transfer.mockImplementationOnce(async () => {
+        throw new TransferError("relay_failed", "retry later", { reservationReleased: true });
+      });
+      const initial = await dissolveSwarm({ name: "team" }, fixture.deps);
+      expect(initial.status).toBe("incomplete");
+      const id = initial.movements[0]!.movementId;
+      expect((await readMovement(fixture.home, id)).dissolution).toBe("team");
+      await mkdir(join(fixture.home, "runs"), { recursive: true });
+      await writeFile(
+        join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json"),
+        JSON.stringify({ v: 1, swarm: "team", account: "team-lead-1", sandboxId: "sbx_remote" }),
+      );
+      fixture.transfer.mockClear();
+      const resume = () =>
+        command === "fund"
+          ? fundSwarm({ name: "team", amountUsd: 1, from: "main" }, fixture.deps)
+          : command === "setup-fund"
+            ? fundSwarm({ name: "team", amountUsd: 1, from: "main", setup: true }, fixture.deps)
+            : command === "rebalance"
+              ? rebalanceSwarm({ name: "team" }, fixture.deps)
+              : command === "leave"
+                ? leaveSwarm({ name: "team", member: "team-lead-1" }, fixture.deps)
+                : executeMovement({ resume: id }, fixture.deps);
+      await expect(resume()).rejects.toThrow("vapi swarm stop team --all");
+      expect(fixture.transfer).not.toHaveBeenCalled();
+      await rm(join(fixture.home, "runs"), { recursive: true });
+      await expect(resume()).resolves.toBeDefined();
+      expect(fixture.transfer).toHaveBeenCalled();
+    },
+  );
+
   it.each([
     {
       label: "orphaned sidecar",

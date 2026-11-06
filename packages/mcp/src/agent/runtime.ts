@@ -11,6 +11,7 @@ import {
   WALLET_NAME_PATTERN,
   withFileLock,
   withSwarmLock,
+  assertSwarmNotDissolving,
   writeJsonAtomic,
   type AgentProfile,
   type WalletStore,
@@ -424,6 +425,7 @@ export async function startDetachedRun(args: {
       // the swarm lock through reservation and key issuance, including cleanup.
       return await withSwarmLock(args.home, args.member.swarm, async () => {
         const swarm = await readSwarm(args.home, args.member.swarm!);
+        await assertSwarmNotDissolving(args.home, swarm.name);
         if (!swarm.members.some((member) => member.account === args.member.account)) {
           throw new RuntimeError(
             "runtime_unavailable",

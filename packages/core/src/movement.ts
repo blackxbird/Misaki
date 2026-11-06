@@ -15,6 +15,10 @@ import { explorerAddressUrl } from "./networks.js";
 import type { Receipt } from "./receipts.js";
 import type { SecretStore } from "./secret-store.js";
 import { releaseSpend } from "./spend-policy.js";
+import { dissolutionSwarm } from "./swarm-dissolution.js";
+import { withSwarmMovementLock } from "./swarm-lock-context.js";
+import { assertSwarmWorkersStopped } from "./swarm-workers.js";
+import { readSwarm } from "./swarm.js";
 import { readTransferJournal, type TransferJournal } from "./transfer-journal.js";
 import {
   transferBetweenAccounts,
@@ -65,6 +69,10 @@ const movementSchema = z.strictObject({
   // The only account a `sweep` leg may name besides the owner. Sweeps skip the
   // spend caps, so the parent comes from the plan, never from a leg's `to`.
   treasury: walletNameSchema.optional(),
+  dissolution: z
+    .string()
+    .regex(/^[a-z][a-z0-9-]{0,15}$/u)
+    .optional(),
   network: z.enum([BASE_MAINNET_CAIP2, ARC_MAINNET_CAIP2]),
   createdAt: z.iso.datetime(),
   legs: z.array(movementLegSchema).min(1),
@@ -100,6 +108,8 @@ export type MovementPlan = {
   reason: Movement["reason"];
   from: WalletName;
   treasury?: WalletName;
+  /** Swarm whose dissolution owns these legs, including member-to-treasury sweeps. */
+  dissolution?: string;
   network: TransferNetwork;
   legs: readonly {
     from?: WalletName;
@@ -174,6 +184,23 @@ export async function executeMovement(
   deps: MovementDependencies,
 ): Promise<Movement> {
   const home = deps.home ?? deps.store.home;
+  const initial = "resume" in plan ? await readMovement(home, parseMovementId(plan.resume)) : plan;
+  const swarm = await dissolutionSwarm(home, initial);
+  if (swarm !== undefined) {
+    // Always acquire the swarm lock before any sender/account movement lock.
+    return await withSwarmMovementLock(home, swarm.name, async () => {
+      await assertSwarmWorkersStopped(home, await readSwarm(home, swarm.name));
+      return await executeMovementLocked(plan, deps);
+    });
+  }
+  return await executeMovementLocked(plan, deps);
+}
+
+async function executeMovementLocked(
+  plan: MovementPlan | { resume: string },
+  deps: MovementDependencies,
+): Promise<Movement> {
+  const home = deps.home ?? deps.store.home;
   if ("resume" in plan) {
     const id = parseMovementId(plan.resume);
     const initial = await readMovement(home, id);
@@ -225,6 +252,7 @@ export async function executeMovement(
       reason: plan.reason,
       from,
       ...(plan.treasury === undefined ? {} : { treasury: plan.treasury }),
+      ...(plan.dissolution === undefined ? {} : { dissolution: plan.dissolution }),
       network: plan.network,
       createdAt: new Date(now()).toISOString(),
       legs: boundLegs.map((leg) => ({

@@ -25,6 +25,7 @@ import { listUnfinishedMovements, readMovement, type MovementSummary } from "./m
 import { configuredNetworkFor, formatUsdc } from "./networks.js";
 import type { SecretStore } from "./secret-store.js";
 import { readUsdcBalance } from "./sweep.js";
+import { trackSwarmLock } from "./swarm-lock-context.js";
 import type { TransferNetwork } from "./transfer.js";
 import { walletNameSchema, type WalletName } from "./wallet-name.js";
 import type { WalletStore } from "./wallet-store.js";
@@ -208,7 +209,9 @@ export async function withSwarmLock<T>(
   assertName(name);
   const path = join(swarmsDirectory(home), `.${name}.lock`);
   try {
-    return await withFileLock(path, fn, { lockedMessage: `Swarm ${name} is locked.` });
+    return await withFileLock(path, async () => await trackSwarmLock(home, name, fn), {
+      lockedMessage: `Swarm ${name} is locked.`,
+    });
   } catch (error) {
     if (error instanceof FileLockedError) throw new SwarmError("swarm_locked", error.message);
     throw error;
