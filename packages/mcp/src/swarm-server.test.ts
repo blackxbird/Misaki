@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   BASE_MAINNET_CAIP2,
+  __setAtomicFileTestHooks,
   WalletStore,
   createAccount,
   getDefaultConfig,
@@ -27,6 +28,7 @@ import { privateKeyToAccount } from "viem/accounts";
 
 import {
   listRunRecords,
+  startDetachedRun,
   writeRunRecord,
   type Runtime,
   type RuntimeStatus,
@@ -71,6 +73,106 @@ afterEach(async () => {
 });
 
 describe("MCP swarm lifecycle", () => {
+  it("serializes a Railway reservation after the eligibility check with dissolution", async () => {
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const checked = deferred();
+    const sweep = deferred();
+    const launchReached = deferred();
+    const allowLaunchLock = deferred();
+    let exporting = false;
+    let launchPending = false;
+    const transfer = vi.fn<MovementTransfer>(async (args) => {
+      expect(exporting, "no sweep may run with an exported key").toBe(false);
+      return {
+        status: "sent",
+        from: args.from,
+        to: OWNER,
+        toName: args.to,
+        toKind: "owner",
+        amountUsd: String(args.amountUsd),
+        amountAtomic: usdToAtomic(args.amountUsd).toString(),
+        network: BASE_MAINNET_CAIP2,
+        txHash: `0x${"34".repeat(32)}`,
+        nonce: (args.nonce ?? args.resume)!,
+        replayed: false,
+      };
+    });
+    const fixture = await runnableSwarmFixture({
+      replies: [],
+      swarm: {
+        transfer,
+        balanceReader: async () => {
+          checked.resolve();
+          await sweep.promise;
+          return 1_000_000n;
+        },
+      },
+    });
+    const runtime: Runtime = {
+      kind: "railway",
+      stop: vi.fn(),
+      status: async () => ({ state: "running" }),
+      start: async (member, run) => {
+        exporting = true;
+        launchReached.resolve();
+        return {
+          runId: run.runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_race",
+        };
+      },
+    };
+    __setAtomicFileTestHooks({
+      beforeLockAttempt: async (path) => {
+        if (launchPending && path === join(fixture.home, "swarms", ".team.lock")) {
+          launchReached.resolve();
+          await allowLaunchLock.promise;
+        }
+      },
+    });
+    try {
+      const dissolving = fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+      await checked.promise;
+      launchPending = true;
+      const launching = startDetachedRun({
+        home: fixture.home,
+        runtime,
+        member: { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" },
+        run: { runId: "run_0123456789abcdef01234567", task: "Work", mode: "agent" },
+      });
+      const launchOutcome = launching.then(
+        () => "started",
+        () => "refused",
+      );
+      await launchReached.promise;
+      sweep.resolve();
+      const dissolved = await dissolving;
+      allowLaunchLock.resolve();
+      expect(await launchOutcome).toBe("refused");
+      expect(dissolved.isError, JSON.stringify(dissolved)).not.toBe(true);
+      expect(dissolved.structuredContent).toMatchObject({ status: "dissolved" });
+      expect(exporting).toBe(false);
+      expect(transfer).toHaveBeenCalled();
+      expect(await listRunRecords(fixture.home)).toEqual([]);
+    } finally {
+      sweep.resolve();
+      allowLaunchLock.resolve();
+      __setAtomicFileTestHooks(undefined);
+      await fixture.server.close();
+    }
+  });
+
   it.each(["starting", "running", "unknown"] as const)(
     "refuses dissolution with a tracked %s Railway run before moving money",
     async (state) => {
