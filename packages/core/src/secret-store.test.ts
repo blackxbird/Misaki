@@ -353,7 +353,9 @@ describe("the libsecret store", () => {
       { code: 0, stdout: "test-only-passphrase\n" },
       { code: 0 },
       { code: 1 },
-      { code: 0 },
+      // Real secret-tool exits 1 with empty stderr when `clear` matches
+      // nothing; that is still a successful removal of an absent entry.
+      { code: 1 },
     ]);
     const store = secretStore({ platform: "linux", run });
 
@@ -364,6 +366,17 @@ describe("the libsecret store", () => {
       args: ["clear", "service", "vapi-network", "account", "main"],
       input: undefined,
     });
+  });
+
+  it("still reports a clear failure that came with a message", async () => {
+    const { run } = recordingRunner([
+      { code: 0, stdout: "test-only-passphrase\n" },
+      { code: 1, stderr: "Cannot autolaunch D-Bus" },
+    ]);
+
+    await expect(secretStore({ platform: "linux", run }).remove("main")).rejects.toThrow(
+      "Could not remove the passphrase of main from the secret service (exit 1). Cannot autolaunch D-Bus",
+    );
   });
 
   it("names the package to install when secret-tool is missing", async () => {

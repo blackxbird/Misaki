@@ -5,6 +5,10 @@ scoped packages. The packages share one version and are released together.
 
 ## Unreleased
 
+### Fixed
+
+- Linux: removing an absent entry from the libsecret keyring no longer throws. `secret-tool clear` exits 1 with empty stderr when it matches nothing on some libsecret builds, and the store treated that as a failure — which broke `vapi login` with "The agent link could not be stored consistently" whenever the agent had no `router.balance` secret yet. A silent non-zero exit from `clear` is now treated as "nothing to remove", mirroring the existing `lookup` behaviour; a failure that comes with a stderr message still throws.
+
 ## 0.12.0 — 2026-10-30
 
 ### Added
