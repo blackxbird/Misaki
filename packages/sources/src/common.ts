@@ -1,5 +1,6 @@
 import {
   createPublicFetch,
+  dedupeProvenance,
   type Listing,
   type ListingProvenance,
   type LookupFn,
@@ -120,16 +121,6 @@ function optionalString(
 ): Partial<Record<typeof key, string>> {
   const value = asString(record[key]);
   return value === undefined ? {} : { [key]: value };
-}
-
-function dedupeProvenance(items: readonly ListingProvenance[]): ListingProvenance[] {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const key = `${item.source}\u0000${item.sourceUrl ?? ""}\u0000${item.ref ?? ""}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 function searchableText(value: unknown): string {

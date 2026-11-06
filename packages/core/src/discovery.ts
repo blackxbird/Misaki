@@ -219,7 +219,8 @@ function optional<Key extends string>(
   return value === undefined || value === "" ? {} : ({ [key]: value } as Record<Key, string>);
 }
 
-function dedupeProvenance(values: readonly ListingProvenance[]): ListingProvenance[] {
+/** Keep the first provenance entry for each source, catalog URL, and native reference. */
+export function dedupeProvenance(values: readonly ListingProvenance[]): ListingProvenance[] {
   const seen = new Set<string>();
   return values.filter((value) => {
     const key = `${value.source}\u0000${value.sourceUrl ?? ""}\u0000${value.ref ?? ""}`;

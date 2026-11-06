@@ -62,7 +62,7 @@ let warnedWalletOption = false;
 export type VapiClientOptions = {
   /** Account name. Defaults to VAPI_WALLET, then the vault default. Pass a viem/VapiPaymentAccount object instead to sign with an injected server account. */
   account?: string | VapiPaymentAccount;
-  /** @deprecated Use `account`. Removed in 0.7. */
+  /** @deprecated Use `account`; removed in the next major release. */
   wallet?: string;
   /** Local state directory. Defaults to VAPI_HOME or ~/.vapi. */
   home?: string;

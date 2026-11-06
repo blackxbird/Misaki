@@ -9,7 +9,7 @@ import {
 import { english, generateMnemonic, HDKey } from "viem/accounts";
 import type { Hex } from "viem";
 
-import { KeystoreError } from "./keystore.js";
+import { KeystoreError } from "./keystore-error.js";
 
 /** BIP-44 first account on Base and every other EVM chain. */
 export const EVM_DERIVATION_PATH = "m/44'/60'/0'/0/0";

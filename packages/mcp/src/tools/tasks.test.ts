@@ -19,11 +19,11 @@ import {
   createPendingTransactions,
   createTasksClient,
   missingTasksChain,
+  safeTasksChainError,
   type TasksChain,
   type TasksClient,
   type TasksClientOptions,
 } from "@vapi-network/core/tasks";
-import { safeTasksChainError } from "../../../core/src/tasks/index.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";

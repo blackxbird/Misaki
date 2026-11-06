@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { discover, mergeListings, type Listing, type Source } from "./discovery.js";
+import {
+  dedupeProvenance,
+  discover,
+  mergeListings,
+  type Listing,
+  type ListingProvenance,
+  type Source,
+} from "./discovery.js";
 
 function listing(url: string, source: string, fields: Partial<Listing> = {}): Listing {
   return {
@@ -11,6 +18,34 @@ function listing(url: string, source: string, fields: Partial<Listing> = {}): Li
 }
 
 describe("discovery merge", () => {
+  it("identifies provenance by source, catalog URL, and ref, preserving the first entry", () => {
+    const values: readonly ListingProvenance[] = Object.freeze([
+      Object.freeze({ source: "vapi" }),
+      Object.freeze({ source: "vapi", sourceUrl: "", ref: "" }),
+      Object.freeze({ source: "bazaar" }),
+      Object.freeze({ source: "vapi", sourceUrl: "https://catalog.example" }),
+      Object.freeze({ source: "vapi", ref: "weather" }),
+      Object.freeze({ source: "vapi", sourceUrl: "https://catalog.example", ref: "weather" }),
+      Object.freeze({ source: "vapi", sourceUrl: "https://catalog.example", ref: "weather" }),
+    ]);
+    const expected = [values[0], values[2], values[3], values[4], values[5]];
+    const result = dedupeProvenance(values);
+    expect(result).toEqual(expected);
+    expect(result[0]).toBe(values[0]);
+    expect(dedupeProvenance([])).toEqual([]);
+
+    // Both cloning a lone listing and merging multiple listings apply the same rule.
+    for (const groups of [
+      [[listing("https://api.example/pay", "vapi", { provenance: values })]],
+      [
+        [listing("https://api.example/pay", "vapi", { provenance: values.slice(0, 4) })],
+        [listing("https://api.example/pay", "vapi", { provenance: values.slice(4) })],
+      ],
+    ]) {
+      expect(mergeListings(groups)[0]?.provenance).toEqual(expected);
+    }
+  });
+
   it("deduplicates on the normalized resource URL while retaining source provenance", () => {
     expect(
       mergeListings([

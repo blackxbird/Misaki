@@ -193,7 +193,7 @@ import {
   type ProbeRejection,
   type ProbeResult,
 } from "./publish-client.js";
-import { CLI_VERSION } from "./version";
+import { CLI_VERSION } from "./version.js";
 
 const HELP_HEADING = "vAPI Network";
 

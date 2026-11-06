@@ -1,4 +1,4 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -50,6 +50,13 @@ afterEach(async () => {
 });
 
 describe("createVapiClient", () => {
+  it("documents wallet removal at the next major release", async () => {
+    const source = await readFile(new URL("./client.ts", import.meta.url), "utf8");
+    expect(source).toMatch(
+      /\/\*\* @deprecated Use `account`; removed in the next major release\. \*\/\s+wallet\?: string;/u,
+    );
+  });
+
   it.each(["lock", "expiry", "protect"] as const)(
     "refuses a cached vault signer after %s and allows a new session",
     async (invalidation) => {
