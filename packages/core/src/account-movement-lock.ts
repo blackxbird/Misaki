@@ -24,20 +24,6 @@ export async function withAccountMovementLock<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
-  return await withSwarmAccountLocks(
-    home,
-    [account],
-    async () => await withAccountMovementLockOnly(home, account, timeoutMs, operation, signal),
-  );
-}
-
-async function withAccountMovementLockOnly<T>(
-  home: string,
-  account: WalletName,
-  timeoutMs: number | undefined,
-  operation: () => Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
   const directory = join(home, "movements");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const path = join(directory, `.${account}.lock`);
@@ -78,11 +64,11 @@ export async function withAccountMovementLocks<T>(
   timeoutMs: number | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
-  return await withSwarmAccountLocks(
+  return await acquireAccountMovementLocks(
     home,
-    accounts,
-    async () =>
-      await acquireAccountMovementLocks(home, [...new Set(accounts)].sort(), timeoutMs, operation),
+    [...new Set(accounts)].sort(),
+    timeoutMs,
+    operation,
   );
 }
 
@@ -94,9 +80,24 @@ async function acquireAccountMovementLocks<T>(
 ): Promise<T> {
   const [account, ...remaining] = accounts;
   if (account === undefined) return await operation();
-  return await withAccountMovementLockOnly(home, account, timeoutMs, async () =>
+  return await withAccountMovementLock(home, account, timeoutMs, async () =>
     acquireAccountMovementLocks(home, remaining, timeoutMs, operation),
   );
+}
+
+/** Money paths take all swarm locks before sender locks; metadata operations keep the plain account lock. */
+export async function withSwarmAccountMovementLocks<T>(
+  home: string,
+  accounts: readonly WalletName[],
+  timeoutMs: number | undefined,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  return await withSwarmAccountLocks(home, accounts, async () => {
+    if (signal !== undefined && accounts.length === 1)
+      return await withAccountMovementLock(home, accounts[0]!, timeoutMs, operation, signal);
+    return await withAccountMovementLocks(home, accounts, timeoutMs, operation);
+  });
 }
 
 async function removeStaleLock(path: string): Promise<void> {

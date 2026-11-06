@@ -14,7 +14,7 @@ import {
   readMovement,
   reconcileUnresolvedMovementsForAccountLocked,
 } from "./movement.js";
-import { withAccountMovementLock } from "./account-movement-lock.js";
+import { withSwarmAccountMovementLocks } from "./account-movement-lock.js";
 import { sweepAboveCeiling } from "./ceiling.js";
 import * as workerGuard from "./swarm-workers.js";
 import { memorySecretStore, type SecretStore } from "./secret-store.js";
@@ -1451,9 +1451,9 @@ describe("dissolving a swarm", () => {
               : entry === "leave"
                 ? leaveSwarm({ name: "team", member: "team-lead-1" }, fixture.deps)
                 : entry === "ceiling-reconcile"
-                  ? withAccountMovementLock(
+                  ? withSwarmAccountMovementLocks(
                       fixture.home,
-                      "team-lead-1",
+                      ["team-lead-1"],
                       undefined,
                       async () =>
                         await reconcileUnresolvedMovementsForAccountLocked(

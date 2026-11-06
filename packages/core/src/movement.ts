@@ -7,7 +7,11 @@ import { bytesToHex, getAddress, isAddress, type Hex } from "viem";
 import { z } from "zod";
 
 import { formatUsdCents, parseUsdCents, RELAY_MAX_PER_TRANSFER_ATOMIC } from "./allocation.js";
-import { AccountMovementLockedError, withAccountMovementLocks } from "./account-movement-lock.js";
+import {
+  AccountMovementLockedError,
+  withAccountMovementLocks,
+  withSwarmAccountMovementLocks,
+} from "./account-movement-lock.js";
 import { checkReceiptSettlement, type AuthorizationState } from "./authorization-state.js";
 import { getVapiPaths, isMissingFile, loadConfig } from "./config.js";
 import { isOpenMovementLeg } from "./movement-open.js";
@@ -191,11 +195,16 @@ async function executeMovementLocked(
   if ("resume" in plan) {
     const id = parseMovementId(plan.resume);
     const initial = await readMovement(home, id);
-    return await withMovementLocks(home, movementSenders(initial), deps.lockTimeoutMs, async () => {
-      const movement = await readMovement(home, id);
-      await assertNoPendingCeilingSweep(deps, movementSenders(movement));
-      return await resumeMovement(movement, home, deps);
-    });
+    return await withCapitalMovementLocks(
+      home,
+      movementSenders(initial),
+      deps.lockTimeoutMs,
+      async () => {
+        const movement = await readMovement(home, id);
+        await assertNoPendingCeilingSweep(deps, movementSenders(movement));
+        return await resumeMovement(movement, home, deps);
+      },
+    );
   }
 
   if (plan.legs.length === 0) {
@@ -210,7 +219,7 @@ async function executeMovementLocked(
   }));
   const senders = sortedUniqueSenders(legs.map((leg) => leg.from));
 
-  return await withMovementLocks(home, senders, deps.lockTimeoutMs, async () => {
+  return await withCapitalMovementLocks(home, senders, deps.lockTimeoutMs, async () => {
     await assertNoPendingCeilingSweep(deps, senders);
     const conflict = await firstUnfinishedMovement(home, senders);
     if (conflict !== undefined) {
@@ -1513,8 +1522,25 @@ async function withMovementLocks<T>(
   timeoutMs: number | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
+  return await mapMovementLockError(
+    async () => await withAccountMovementLocks(home, senders, timeoutMs, operation),
+  );
+}
+
+async function withCapitalMovementLocks<T>(
+  home: string,
+  senders: readonly WalletName[],
+  timeoutMs: number | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return await mapMovementLockError(
+    async () => await withSwarmAccountMovementLocks(home, senders, timeoutMs, operation),
+  );
+}
+
+async function mapMovementLockError<T>(operation: () => Promise<T>): Promise<T> {
   try {
-    return await withAccountMovementLocks(home, senders, timeoutMs, operation);
+    return await operation();
   } catch (error) {
     if (error instanceof AccountMovementLockedError)
       throw new MovementError(

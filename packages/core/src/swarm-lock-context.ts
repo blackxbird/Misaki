@@ -4,7 +4,13 @@ import { resolve } from "node:path";
 import { listSwarms, swarmAccountNames, withSwarmLock } from "./swarm.js";
 
 type HeldLock = { home: string; name: string; active: boolean };
-const heldLocks = new AsyncLocalStorage<HeldLock[]>();
+// CLI/MCP tarballs bundle independent core copies. Share ownership context,
+// which contains only paths and lifecycle flags, through Node's symbol registry.
+const registryKey = Symbol.for("@vapi-network/core/swarm-lock-context/v1");
+const registry = globalThis as typeof globalThis & {
+  [registryKey]?: AsyncLocalStorage<HeldLock[]>;
+};
+const heldLocks = (registry[registryKey] ??= new AsyncLocalStorage<HeldLock[]>());
 
 /** Internal ownership context: movement execution can reuse its caller's lock. */
 export async function trackSwarmLock<T>(

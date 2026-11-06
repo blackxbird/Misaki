@@ -2,7 +2,10 @@ import { randomBytes } from "node:crypto";
 
 import { bytesToHex, getAddress, isAddress, type Hex } from "viem";
 
-import { AccountMovementLockedError, withAccountMovementLock } from "./account-movement-lock.js";
+import {
+  AccountMovementLockedError,
+  withSwarmAccountMovementLocks,
+} from "./account-movement-lock.js";
 import { appendAudit, type AuditRecord } from "./audit.js";
 import { checkReceiptSettlement, type AuthorizationState } from "./authorization-state.js";
 import { getVapiPaths, type VapiConfig } from "./config.js";
@@ -669,9 +672,9 @@ async function withCeilingSweepLock<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   try {
-    return await withAccountMovementLock(
+    return await withSwarmAccountMovementLocks(
       args.store.home,
-      args.account,
+      [args.account],
       args.timeoutMs ?? CEILING_SWEEP_TIMEOUT_MS,
       operation,
       args.signal,

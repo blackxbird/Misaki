@@ -193,6 +193,7 @@ export async function executeTransfer(
   args: TransferArgs,
   transport?: (args: TransferArgs) => Promise<TransferResult>,
 ): Promise<TransferResult> {
+  args.signal?.throwIfAborted();
   const home = args.home ?? args.store.home;
   return await withSwarmAccountLocks(home, [args.from], async () => {
     for (const swarm of await listSwarms(home)) {
@@ -204,6 +205,7 @@ export async function executeTransfer(
       await args.reconcileRuns?.({ home, name: swarm.name });
       await assertSwarmWorkersStopped(home, swarm);
     }
+    args.signal?.throwIfAborted();
     return await (
       transport === undefined || transport === transferBetweenAccounts ? performTransfer : transport
     )(args);
