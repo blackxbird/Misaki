@@ -373,6 +373,43 @@ describe("vapi router buy", () => {
 });
 
 describe("vapi router chat", () => {
+  it("keeps auto-refill warnings in chat JSON and human diagnostics", async () => {
+    await initializedHome();
+    const refill = {
+      ...purchaseResult(null),
+      warnings: [
+        {
+          code: "balance_unavailable" as const,
+          message: "Payment succeeded; balance unavailable.",
+        },
+      ],
+    };
+    const dependencies = commandDependencies({
+      router: { routerChat: async () => ({ ...chatResult(), refill }) },
+    });
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi", "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      content: "Done.",
+      refill: { receiptId: "router-receipt", balance: null, warnings: refill.warnings },
+    });
+    const human = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi"],
+        human.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(human.stderr).toContain(refill.warnings[0]!.message);
+  });
+
   it("builds system and user messages and prints human and JSON results", async () => {
     await initializedHome();
     const result: ChatResult = {

@@ -97,6 +97,59 @@ async function paths() {
 }
 
 describe("payRequest", () => {
+  it("validates receipt metadata before sending a payment", async () => {
+    const localPaths = await paths();
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(paymentRequired())
+      .mockResolvedValueOnce(paidResponse());
+    await expect(
+      payRequest({
+        url: "https://vendor.example/paid",
+        init: { method: "POST" },
+        account: privateKeyToAccount(PRIVATE_KEY),
+        wallet: "main",
+        source: "",
+        caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+        config: getDefaultConfig(),
+        fetchImpl,
+        paths: localPaths,
+        now: NOW,
+        lookup: async () => ["93.184.216.34"],
+      }),
+    ).rejects.toBeDefined();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("returns a warning when receipt validation fails after settlement", async () => {
+    const localPaths = await paths();
+    let settled = false;
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      if (settled) throw new Error("Unexpected repeat payment");
+      if (fetchImpl.mock.calls.length === 1) return paymentRequired();
+      settled = true;
+      return paidResponse();
+    });
+    const result = await payRequest({
+      url: "https://vendor.example/paid",
+      init: { method: "POST" },
+      account: privateKeyToAccount(PRIVATE_KEY),
+      wallet: "main",
+      caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+      config: getDefaultConfig(),
+      fetchImpl,
+      paths: localPaths,
+      now: NOW,
+      nowMs: () => (settled ? NaN : 0),
+      lookup: async () => ["93.184.216.34"],
+    });
+    expect(result).toMatchObject({
+      receipt: { outcome: "paid", settlement: { outcome: "succeeded" } },
+      warnings: [{ code: "receipt_unavailable" }],
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("retains the settled receipt when response-proof processing fails after confirmation", async () => {
     const localPaths = await paths();
     const paid = paidResponse();

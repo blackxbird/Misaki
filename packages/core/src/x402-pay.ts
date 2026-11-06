@@ -158,7 +158,13 @@ export type CompleteX402PaymentResult<T = undefined> = {
  * quote, payer, authorization, or settlement fields. The existing receipt
  * vocabulary records a successful unpaid response as `paid`.
  */
-export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult> {
+export async function payRequest(input: PayRequestArgs): Promise<PayRequestResult> {
+  // Snapshot caller-controlled metadata before any asynchronous payment work.
+  const args: PayRequestArgs = {
+    ...input,
+    ...(input.run === undefined ? {} : { run: { ...input.run } }),
+    ...(input.now === undefined ? {} : { now: new Date(input.now.getTime()) }),
+  };
   const startedAt = args.now ?? new Date();
   assertAllowanceCurrent(startedAt, args.allowanceExpiresAt);
   const nowMs = args.nowMs ?? (() => performance.now());
@@ -169,6 +175,15 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
   const ledgerPath = args.paths?.ledgerPath ?? defaults.ledger;
   const receiptsPath = args.paths?.receiptsPath ?? defaults.receipts;
   const request = new Request(args.url, { ...args.init, redirect: "manual" });
+  parseReceipt({
+    id: receiptId,
+    timestamp: startedAt.toISOString(),
+    resourceUrl: request.url,
+    method: request.method,
+    wallet: args.wallet,
+    source: args.source ?? "direct",
+    ...(args.run === undefined ? {} : { run: args.run }),
+  });
   const fetchImpl = guardedFetch(args.fetchImpl, {
     allowPrivateNetwork: args.config.allowPrivateNetwork ?? false,
     lookup: args.lookup,
@@ -261,7 +276,9 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
     receipt = await appendReceipt(receipt, receiptsPath, { wallet: args.wallet });
   } catch (error) {
     if (trace.settlement?.outcome !== "succeeded") throw error;
-    receipt = parseReceipt({ ...receipt, wallet: args.wallet });
+    // Never validate the same rejected receipt a second time after settlement.
+    // The financial evidence and prevalidated metadata remain available in memory.
+    receipt = { ...receipt, wallet: args.wallet };
     warnings.push({
       code: "receipt_unavailable",
       message:

@@ -9,6 +9,7 @@ import {
   routerPurchaseSummary,
   type AgentRouterUsage,
   type RouterClientDeps,
+  type RouterPurchaseResult,
 } from "@vapi-network/core/router-client";
 import { z } from "zod";
 
@@ -88,6 +89,31 @@ export const routerUsageTool = {
   }),
 };
 
+const purchaseSchema = z.object({
+  receipt: z.object({
+    id: z.string(),
+    amountUsd: z.number().nullable(),
+    network: z.string(),
+    transaction: z.string().optional(),
+  }),
+  balance: routerUsageSchema.balance,
+  warnings: z
+    .array(
+      z.object({
+        code: z.enum([
+          "audit_unavailable",
+          "router_key_unavailable",
+          "balance_unavailable",
+          "purchase_response_unavailable",
+          "receipt_unavailable",
+          "payment_followup_unavailable",
+        ]),
+        message: z.string(),
+      }),
+    )
+    .optional(),
+});
+
 export const routerChatTool = {
   description: `Send a text conversation through vAPI Router. Tool calls are not accepted. ${KEY_SAFETY_DESCRIPTION}`,
   inputSchema: routerChatInputShape,
@@ -96,6 +122,7 @@ export const routerChatTool = {
     content: z.string().nullable(),
     model: z.string(),
     usage: usageSchema.optional(),
+    refill: purchaseSchema.optional(),
   }),
 };
 
@@ -103,30 +130,7 @@ export const routerBuyTool = {
   description: `Buy prepaid vAPI Router balance with the selected local wallet, subject to that wallet's daily spend cap. ${KEY_SAFETY_DESCRIPTION}`,
   inputSchema: routerBuyInputShape,
   strictInput: true,
-  outputSchema: z.object({
-    receipt: z.object({
-      id: z.string(),
-      amountUsd: z.number().nullable(),
-      network: z.string(),
-      transaction: z.string().optional(),
-    }),
-    balance: routerUsageSchema.balance,
-    warnings: z
-      .array(
-        z.object({
-          code: z.enum([
-            "audit_unavailable",
-            "router_key_unavailable",
-            "balance_unavailable",
-            "purchase_response_unavailable",
-            "receipt_unavailable",
-            "payment_followup_unavailable",
-          ]),
-          message: z.string(),
-        }),
-      )
-      .optional(),
-  }),
+  outputSchema: purchaseSchema,
 };
 
 export type RouterCoreOverrides = {
@@ -202,6 +206,7 @@ export function createRouterTools(options: RouterToolsOptions): {
         content: result.content,
         model: result.model,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
+        ...(result.refill === undefined ? {} : { refill: publicPurchase(result.refill) }),
       });
     },
 
@@ -249,22 +254,24 @@ export function createRouterTools(options: RouterToolsOptions): {
         },
         parsed.usd,
       );
-      const { amountUsd, network } = routerPurchaseSummary(result.receipt);
-      return toolResult({
-        receipt: {
-          id: result.receipt.id,
-          amountUsd,
-          network,
-          ...(result.receipt.settlement?.transaction === undefined
-            ? {}
-            : { transaction: result.receipt.settlement.transaction }),
-        },
-        balance: publicBalance(result.balance),
-        ...(result.warnings === undefined
-          ? {}
-          : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
-      });
+      return toolResult(publicPurchase(result));
     },
+  };
+}
+
+function publicPurchase(result: RouterPurchaseResult) {
+  return {
+    receipt: {
+      id: result.receipt.id,
+      ...routerPurchaseSummary(result.receipt),
+      ...(result.receipt.settlement?.transaction === undefined
+        ? {}
+        : { transaction: result.receipt.settlement.transaction }),
+    },
+    balance: publicBalance(result.balance),
+    ...(result.warnings === undefined
+      ? {}
+      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
   };
 }
 

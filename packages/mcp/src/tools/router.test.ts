@@ -282,6 +282,43 @@ describe("vAPI Router MCP tools", () => {
     await server.close();
   });
 
+  it("returns auto-refill warnings with successful chat without private fields", async () => {
+    const refill = {
+      receipt: {
+        id: "paid-refill",
+        timestamp: RESET_TIME,
+        resourceUrl: "https://api.example/topup",
+        quote: { amountAtomic: "1000000", network: "eip155:8453" },
+        secret: "hidden",
+      },
+      balance: null,
+      warnings: [
+        {
+          code: "balance_unavailable" as const,
+          message: "Payment succeeded; balance unavailable.",
+          secret: "hidden",
+        },
+      ],
+    };
+    const { server } = await routerServer({
+      routerChat: async () => ({ ...chatResult(), refill }),
+    });
+    const result = await server.callTool({
+      name: "router.chat",
+      arguments: { model: "m", messages: [{ role: "user", content: "hi" }] },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      refill: {
+        receipt: { id: "paid-refill", amountUsd: 1 },
+        balance: null,
+        warnings: [{ code: "balance_unavailable" }],
+      },
+    });
+    expectPublicValue(result);
+    await server.close();
+  });
+
   it("returns budget exhaustion with its reset time as a normal tool error", async () => {
     const routerChat = vi.fn<NonNullable<RouterOverrides["routerChat"]>>(async () => {
       throw new RouterClientError(

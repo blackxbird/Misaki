@@ -17,6 +17,7 @@ import {
   routerUsage,
   routerPurchaseSummary,
   type RouterClientDeps,
+  type RouterPurchaseResult,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
 import { AGENT_LINK_REVOKED_MESSAGE } from "@vapi-network/core/agent-link";
@@ -175,11 +176,13 @@ async function chatCommand(
         model: result.model,
         content: result.content,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
+        ...(result.refill === undefined ? {} : { refill: publicPurchase(result.refill) }),
       }),
     );
     return;
   }
   io.stdout(result.content ?? "");
+  for (const warning of result.refill?.warnings ?? []) io.stderr(warning.message);
 }
 
 async function buyCommand(
@@ -256,19 +259,8 @@ async function buyCommand(
     throw error;
   }
 
-  const { amountUsd, network } = routerPurchaseSummary(result.receipt);
-  const transaction = result.receipt.settlement?.transaction;
-  const summary = {
-    tierUsd,
-    amountUsd,
-    network,
-    ...(transaction === undefined ? {} : { transaction }),
-    receiptId: result.receipt.id,
-    balance: result.balance,
-    ...(result.warnings === undefined
-      ? {}
-      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
-  };
+  const summary = { tierUsd, ...publicPurchase(result) };
+  const { amountUsd, network } = summary;
   if (json) {
     io.stdout(JSON.stringify(summary));
     return;
@@ -329,6 +321,20 @@ export function routerDeps(target: WalletTarget, dependencies: CliDependencies):
     wallets: target.store,
     wallet: target.name,
     ...(dependencies.fetchImpl === undefined ? {} : { fetchImpl: dependencies.fetchImpl }),
+  };
+}
+
+function publicPurchase(result: RouterPurchaseResult) {
+  return {
+    ...routerPurchaseSummary(result.receipt),
+    ...(result.receipt.settlement?.transaction === undefined
+      ? {}
+      : { transaction: result.receipt.settlement.transaction }),
+    receiptId: result.receipt.id,
+    balance: result.balance,
+    ...(result.warnings === undefined
+      ? {}
+      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
   };
 }
 

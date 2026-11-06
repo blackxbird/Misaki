@@ -239,6 +239,52 @@ function usageResponse() {
 }
 
 describe("routerChat", () => {
+  it("continues chat and returns the paid refill warning when post-payment usage is unavailable", async () => {
+    let chats = 0;
+    let usageCalls = 0;
+    let paid = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      if (url.host === "router.example") {
+        if (++chats === 1) return new Response("Budget has been exceeded", { status: 429 });
+        expect(headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+        return Response.json({ choices: [{ message: { content: "paid chat continues" } }] });
+      }
+      if (url.pathname === "/api/agents/self/router") {
+        if (++usageCalls > 1) return new Response("unavailable", { status: 503 });
+        return Response.json({
+          ...usageResponse(),
+          balance: { purchasedUsd: 0, spentUsd: 0, remainingUsd: 0 },
+        });
+      }
+      if (url.pathname === "/api/router/top-up/1") {
+        if (!headers.has("payment-signature")) return topupRequired(1);
+        paid++;
+        return topupAccepted(1);
+      }
+      throw new Error(`Unexpected test URL ${url}`);
+    });
+    const deps = await linkedDeps(fetchImpl, {
+      balanceKey: BALANCE_KEY,
+      routerRefill: { belowUsd: 1, tierUsd: 1 },
+    });
+    const result = await routerChat(
+      { ...deps, refill: refillOptions(deps.wallets) },
+      { model: "model", messages: [] },
+    );
+    expect(result).toMatchObject({
+      content: "paid chat continues",
+      keyUsed: "balance",
+      refill: {
+        receipt: { outcome: "paid" },
+        balance: null,
+        warnings: [{ code: "balance_unavailable" }],
+      },
+    });
+    expect(paid).toBe(1);
+  });
+
   it("sends the stake key only to the Router and passes tool fields through", async () => {
     const calls: Array<{ url: URL; init?: RequestInit }> = [];
     const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {

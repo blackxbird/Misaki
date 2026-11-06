@@ -57,6 +57,8 @@ export type ChatRequest = {
 };
 
 export type ChatResult = {
+  /** A successful automatic purchase, including any post-payment warnings. */
+  refill?: RouterPurchaseResult;
   content: string | null;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
@@ -393,6 +395,7 @@ export async function routerChat(
     }
     const resetsAt = usage?.compute.resetsAt ?? "00:00 UTC";
     let balance = usage?.balance;
+    let purchase: RouterPurchaseResult | undefined;
     const refill = deps.wallets.entry(deps.wallet)?.routerRefill;
 
     if (
@@ -406,29 +409,27 @@ export async function routerChat(
           resolveRefillValue(deps.refill.account),
           resolveRefillValue(deps.refill.caps),
         ]);
-        balance = (
-          await buyRouterBalance(
-            {
-              ...deps,
-              account,
-              config: deps.refill.config,
-              caps,
-              ...(deps.refill.paths === undefined ? {} : { paths: deps.refill.paths }),
-              ...(deps.refill.now === undefined
-                ? {}
-                : {
-                    now:
-                      typeof deps.refill.now === "function" ? deps.refill.now() : deps.refill.now,
-                  }),
-              ...(deps.refill.allowanceExpiresAt === undefined
-                ? {}
-                : { allowanceExpiresAt: deps.refill.allowanceExpiresAt }),
-              ...(deps.refill.runBudget === undefined ? {} : { runBudget: deps.refill.runBudget }),
-              ...(deps.refill.run === undefined ? {} : { run: deps.refill.run }),
-            },
-            refill.tierUsd,
-          )
-        ).balance;
+        purchase = await buyRouterBalance(
+          {
+            ...deps,
+            account,
+            config: deps.refill.config,
+            caps,
+            ...(deps.refill.paths === undefined ? {} : { paths: deps.refill.paths }),
+            ...(deps.refill.now === undefined
+              ? {}
+              : {
+                  now: typeof deps.refill.now === "function" ? deps.refill.now() : deps.refill.now,
+                }),
+            ...(deps.refill.allowanceExpiresAt === undefined
+              ? {}
+              : { allowanceExpiresAt: deps.refill.allowanceExpiresAt }),
+            ...(deps.refill.runBudget === undefined ? {} : { runBudget: deps.refill.runBudget }),
+            ...(deps.refill.run === undefined ? {} : { run: deps.refill.run }),
+          },
+          refill.tierUsd,
+        );
+        balance = purchase.balance;
       } catch (refillError) {
         await appendAudit(deps.wallets.home, {
           event: "router.refill.declined",
@@ -443,18 +444,22 @@ export async function routerChat(
       }
     }
 
-    const mayHaveBalance = usage === undefined || (balance?.remainingUsd ?? 0) > 0;
+    const mayHaveBalance =
+      usage === undefined ||
+      (purchase !== undefined && balance === null) ||
+      (balance?.remainingUsd ?? 0) > 0;
     if (mayHaveBalance) {
       const balanceCredentials = await routerBalanceCredentialSnapshot(deps);
       if (balanceCredentials !== undefined) {
         try {
-          return await sendRouterChat(
+          const result = await sendRouterChat(
             deps,
             balanceCredentials.routerBaseUrl,
             balanceCredentials.routerKey,
             request,
             "balance",
           );
+          return { ...result, ...(purchase === undefined ? {} : { refill: purchase }) };
         } catch (balanceError) {
           if (
             balanceError instanceof RouterClientError &&

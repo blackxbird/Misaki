@@ -11,6 +11,10 @@ scoped packages. The packages share one version and are released together.
 
 ### Breaking (SDK)
 
+- Core exports `withCapitalLocks` and `CapitalLockRequest`. Money operations pre-acquire all required swarm locks by name, then account locks by name; nested requests outside that set reject with `SwarmError("swarm_locked")`. SDK callers composing capital operations must declare the full set up front. Plain account metadata locks preserve their existing busy-account refusal.
+- `executeTransfer` adds a `kind: "direct-sweep"` overload. `sweepBack` exports `SweepBackArgs` with an optional configuration `home`, binds its signer to local swarm accounts and uses the same guarded executor; it can now refuse unresolved ownership, workers or lock contention before any RPC.
+- Router `ChatResult` adds optional `refill: RouterPurchaseResult`; CLI chat JSON and MCP chat output expose its public receipt summary, balance and warnings. A successful automatic refill with an unavailable balance still attempts chat with the balance key.
+- `withSwarmLock` preserves a nested `FileLockedError` instead of relabeling it `SwarmError("swarm_locked")`; only its own lock-acquisition timeout is converted to swarm contention.
 - `buyRouterBalance` returns `RouterPurchaseResult` with optional typed warnings. `routerPurchaseSummary`, CLI purchase JSON and MCP purchase output allow `amountUsd: null` and `network: "unknown"` when charged metadata is absent.
 - `payRequest` returns the confirmed in-memory receipt with `PaymentWarning` entries when receipt persistence or post-settlement processing fails, instead of rejecting. Callers must retain the receipt and must not retry payment for these warnings.
 - `executeMovement` and `transferBetweenAccounts` take swarm locks before signing or relaying swarm funds and can reject with `SwarmError("swarm_locked")` on contention. Railway `startDetachedRun` rechecks swarm membership and dissolve intent and can reject with swarm validation errors; contention is normalized to the existing `RuntimeError("member_busy")` skip.
@@ -19,6 +23,11 @@ scoped packages. The packages share one version and are released together.
 
 ### Fixed
 
+- Cross-swarm funding acquires the complete connected lock set in one canonical order, preventing opposing transfers from deadlocking. Undeclared nested swarm or account acquisition refuses before signing.
+- Direct CLI/SDK sweeps use the common dissolution guard; raw sweep and relay broadcasters are private to the transfer module.
+- Member-only legacy dissolution journals establish intent even when both newer intent markers are absent.
+- Automatic Router refills retain paid receipts and warnings through chat, including a failed post-payment balance lookup.
+- x402 receipt metadata is snapshotted and validated before paying. Validation failures after confirmed settlement return the receipt with a warning instead of rejecting.
 - Bundled CLI/MCP copies share swarm lock ownership without reacquiring their own lock. Metadata-only backup and account operations retain ordinary account locking.
 - Every signing or rebroadcast route uses one guarded transfer executor, including ceiling reconciliation and custom transports. Recorded dissolve intent protects legacy member-to-treasury legs and survives gaps between sweeps.
 - Railway member-lock contention remains a `member_busy` skip through the shared swarm lock, preserving members already started in the same run.
