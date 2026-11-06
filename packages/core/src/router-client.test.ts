@@ -1063,6 +1063,39 @@ describe("buyRouterBalance", () => {
 });
 
 describe("confirmed Router purchases", () => {
+  it.each(["receipt", "key-store"] as const)(
+    "returns the confirmed receipt when %s persistence fails",
+    async (failure) => {
+      const deps = await linkedDeps(vi.fn());
+      const transport = purchaseTransport(deps.wallets.home, failure, ROUTER_BASE);
+      if (failure === "key-store") {
+        const set = deps.secrets.set.bind(deps.secrets);
+        vi.spyOn(deps.secrets, "set").mockImplementation(async (account, value) => {
+          if (account === agentSecretAccounts("main").routerBalance)
+            throw new Error("private-store-error-must-not-leak");
+          await set(account, value);
+        });
+      }
+      const result = await buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+        5,
+      );
+      expect(transport.calls.paid).toBe(1);
+      expect(result.receipt).toMatchObject({
+        outcome: "paid",
+        settlement: { outcome: "succeeded" },
+      });
+      expect(result.warnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: failure === "receipt" ? "receipt_unavailable" : "router_key_unavailable",
+          }),
+        ]),
+      );
+      expect(JSON.stringify(result)).not.toContain("private-store-error-must-not-leak");
+    },
+  );
+
   it.each(["audit", "key", "balance", "all", "response"] as const)(
     "returns the paid receipt when %s follow-up fails",
     async (failure) => {

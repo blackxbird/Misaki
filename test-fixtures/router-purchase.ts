@@ -6,7 +6,7 @@ import { BASE_MAINNET_CAIP2, NETWORKS } from "../packages/core/src/networks.js";
 /** Real x402 challenge/payment transport; only the follow-up failure is injected. */
 export function purchaseTransport(
   home: string,
-  failure: "audit" | "key" | "balance" | "all" | "response",
+  failure: "audit" | "key" | "balance" | "all" | "response" | "receipt" | "key-store",
   routerBase = "https://router.example",
 ) {
   const calls = { paid: 0, key: 0, balance: 0 };
@@ -35,6 +35,7 @@ export function purchaseTransport(
         );
       }
       calls.paid++;
+      if (failure === "receipt") await mkdir(join(home, "receipts.jsonl"));
       if (failure === "audit" || failure === "all") {
         await rm(join(home, "audit.log"), { force: true });
         await mkdir(join(home, "audit.log"));

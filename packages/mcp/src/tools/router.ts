@@ -119,6 +119,8 @@ export const routerBuyTool = {
             "router_key_unavailable",
             "balance_unavailable",
             "purchase_response_unavailable",
+            "receipt_unavailable",
+            "payment_followup_unavailable",
           ]),
           message: z.string(),
         }),

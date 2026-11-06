@@ -16,6 +16,7 @@ import type { VapiPaymentAccount } from "./keystore.js";
 import { createPublicFetch } from "./net-guard.js";
 import { formatUsdc } from "./networks.js";
 import type { Receipt } from "./receipts.js";
+import type { PaymentWarning } from "./payment-warning.js";
 import type { RunBudget } from "./run-budget.js";
 import type { SecretStore } from "./secret-store.js";
 import { SpendCapExceededError } from "./spend-cap-exceeded.js";
@@ -239,14 +240,7 @@ export function routerPurchaseSummary(receipt: Receipt): {
   };
 }
 
-export type RouterPurchaseWarning = {
-  code:
-    | "audit_unavailable"
-    | "router_key_unavailable"
-    | "balance_unavailable"
-    | "purchase_response_unavailable";
-  message: string;
-};
+export type RouterPurchaseWarning = PaymentWarning;
 
 export type RouterPurchaseResult = {
   receipt: Receipt;
@@ -272,7 +266,11 @@ export async function buyRouterBalance(
     throw new RouterClientError("http", "Router balance must use a $1, $5, $20, or $50 tier.");
   }
   const { link, accessToken } = await purchaseCredentialSnapshot(deps);
-  const { response, receipt } = await payRequest({
+  const {
+    response,
+    receipt,
+    warnings: paymentWarnings,
+  } = await payRequest({
     url: `${trimTrailingSlashes(link.apiBase)}/api/router/top-up/${tierUsd}`,
     init: {
       method: "POST",
@@ -319,7 +317,7 @@ export async function buyRouterBalance(
     );
   }
 
-  const warnings: RouterPurchaseWarning[] = [];
+  const warnings: RouterPurchaseWarning[] = [...(paymentWarnings ?? [])];
   if (!response.ok)
     warnings.push({
       code: "purchase_response_unavailable",

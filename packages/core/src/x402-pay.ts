@@ -7,7 +7,8 @@ import { getVapiPaths } from "./config.js";
 import type { VapiPaymentAccount } from "./keystore.js";
 import { assertPublicUrl, createPublicFetch, type LookupFn } from "./net-guard.js";
 import { areSamePaymentNetwork, explorerTransactionUrl, formatUsdc } from "./networks.js";
-import { appendReceipt, type Receipt } from "./receipts.js";
+import { appendReceipt, parseReceipt, type Receipt } from "./receipts.js";
+import type { PaymentWarning } from "./payment-warning.js";
 import { RunBudgetError, type RunBudget } from "./run-budget.js";
 import { SpendCapExceededError } from "./spend-cap-exceeded.js";
 import { releaseSpend, reserveSpend, SpendCapError } from "./spend-policy.js";
@@ -51,7 +52,11 @@ export type PayRequestArgs = {
   run?: RunRef;
 };
 
-export type PayRequestResult = { response: Response; receipt: Receipt };
+export type PayRequestResult = {
+  response: Response;
+  receipt: Receipt;
+  warnings?: PaymentWarning[];
+};
 
 export type X402PaymentAttempt = {
   response: Response;
@@ -169,6 +174,9 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
     lookup: args.lookup,
   });
   let response: Response | undefined;
+  let paidResponse: Response | undefined;
+  let paidRequest: Request | undefined;
+  const warnings: PaymentWarning[] = [];
   let receiptRequest = request;
   let outcome: NonNullable<Receipt["outcome"]>;
 
@@ -183,11 +191,10 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
         account: args.account,
         caps: args.caps,
         config: args.config,
-        send: async (paidRequest) => {
-          const paidResponse = await fetchImpl(
-            new Request(paidRequest.clone(), { redirect: "manual" }),
-          );
-          return directAttempt(paidResponse, paidRequest);
+        send: async (requestToPay) => {
+          paidRequest = requestToPay;
+          paidResponse = await fetchImpl(new Request(requestToPay.clone(), { redirect: "manual" }));
+          return directAttempt(paidResponse, requestToPay);
         },
         fetchImpl,
         ledgerPath,
@@ -209,31 +216,59 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
       outcome = completed.settlementOutcome === "succeeded" ? "paid" : "settlement_unknown";
     }
   } catch (error) {
-    const safeError = sanitizeThrownError(error, requestSecretValues(request.headers));
-    const errorReceipt = directReceipt(
-      args,
-      request,
-      trace,
-      receiptId,
-      startedAt,
-      elapsed(nowMs, startedMs),
-      {
-        outcome: paymentErrorOutcome(safeError),
-        error: { code: errorCode(safeError), message: receiptSafeErrorMessage(safeError) },
-      },
-    );
-    await appendReceipt(errorReceipt, receiptsPath, { wallet: args.wallet }).catch(() => undefined);
-    throw safeError;
+    if (trace.settlement?.outcome === "succeeded" && paidResponse !== undefined) {
+      response = paidResponse;
+      receiptRequest = paidRequest ?? request;
+      outcome = "paid";
+      warnings.push({
+        code: "payment_followup_unavailable",
+        message:
+          "Payment settled, but post-payment processing failed. Keep the returned receipt; do not repeat the payment.",
+      });
+    } else {
+      const safeError = sanitizeThrownError(error, requestSecretValues(request.headers));
+      const errorReceipt = directReceipt(
+        args,
+        request,
+        trace,
+        receiptId,
+        startedAt,
+        elapsed(nowMs, startedMs),
+        {
+          outcome: paymentErrorOutcome(safeError),
+          error: { code: errorCode(safeError), message: receiptSafeErrorMessage(safeError) },
+        },
+      );
+      await appendReceipt(errorReceipt, receiptsPath, { wallet: args.wallet }).catch(
+        () => undefined,
+      );
+      throw safeError;
+    }
   }
 
-  const receipt = await appendReceipt(
-    directReceipt(args, receiptRequest, trace, receiptId, startedAt, elapsed(nowMs, startedMs), {
+  let receipt = directReceipt(
+    args,
+    receiptRequest,
+    trace,
+    receiptId,
+    startedAt,
+    elapsed(nowMs, startedMs),
+    {
       outcome,
-    }),
-    receiptsPath,
-    { wallet: args.wallet },
+    },
   );
-  return { response, receipt };
+  try {
+    receipt = await appendReceipt(receipt, receiptsPath, { wallet: args.wallet });
+  } catch (error) {
+    if (trace.settlement?.outcome !== "succeeded") throw error;
+    receipt = parseReceipt({ ...receipt, wallet: args.wallet });
+    warnings.push({
+      code: "receipt_unavailable",
+      message:
+        "Payment settled, but its receipt could not be saved locally. Save the returned receipt; do not repeat the payment.",
+    });
+  }
+  return { response, receipt, ...(warnings.length === 0 ? {} : { warnings }) };
 }
 
 /**

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect } from "node:util";
@@ -97,6 +97,72 @@ async function paths() {
 }
 
 describe("payRequest", () => {
+  it("retains the settled receipt when response-proof processing fails after confirmation", async () => {
+    const localPaths = await paths();
+    const paid = paidResponse();
+    const get = paid.headers.get.bind(paid.headers);
+    vi.spyOn(paid.headers, "get").mockImplementation((name) => {
+      if (name.toLowerCase() === "x-vapi-payment-proof")
+        throw new Error("private-proof-error-must-not-leak");
+      return get(name);
+    });
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(paymentRequired())
+      .mockResolvedValueOnce(paid);
+    const result = await payRequest({
+      url: "https://vendor.example/paid",
+      init: { method: "POST" },
+      account: privateKeyToAccount(PRIVATE_KEY),
+      wallet: "main",
+      caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+      config: getDefaultConfig(),
+      fetchImpl,
+      paths: localPaths,
+      now: NOW,
+      lookup: async () => ["93.184.216.34"],
+    });
+    expect(result).toMatchObject({
+      receipt: { outcome: "paid", settlement: { outcome: "succeeded" } },
+      warnings: [{ code: "payment_followup_unavailable" }],
+    });
+    expect(JSON.stringify(result)).not.toContain("private-proof-error-must-not-leak");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([true, false])(
+    "receipt-write failure becomes a warning only after confirmed settlement=%s",
+    async (confirmed) => {
+      const localPaths = await paths();
+      await mkdir(localPaths.receiptsPath);
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(confirmed ? paymentRequired() : new Response("unpaid"));
+      if (confirmed) fetchImpl.mockResolvedValueOnce(paidResponse());
+      const payment = payRequest({
+        url: "https://vendor.example/paid",
+        init: { method: "POST" },
+        account: privateKeyToAccount(PRIVATE_KEY),
+        wallet: "main",
+        caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+        config: getDefaultConfig(),
+        fetchImpl,
+        paths: localPaths,
+        now: NOW,
+        lookup: async () => ["93.184.216.34"],
+      });
+      if (confirmed) {
+        await expect(payment).resolves.toMatchObject({
+          receipt: { wallet: "main", outcome: "paid", settlement: { outcome: "succeeded" } },
+          warnings: [{ code: "receipt_unavailable" }],
+        });
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+      } else {
+        await expect(payment).rejects.toMatchObject({ code: "EISDIR" });
+      }
+    },
+  );
+
   it("preserves a non-secret Uint8Array consumed response body", async () => {
     const localPaths = await paths();
     const bytes = Uint8Array.from([0, 1, 2, 127, 255]);

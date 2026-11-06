@@ -135,6 +135,7 @@ export * from "./wallet-store.js";
 export * from "./x402.js";
 export * from "./remote-account.js";
 export * from "./x402-pay.js";
+export type { PaymentWarning } from "./payment-warning.js";
 export {
   ARC_MAINNET_CAIP2,
   BROWSER_ENABLED_X402_NETWORK_CONFIG,
