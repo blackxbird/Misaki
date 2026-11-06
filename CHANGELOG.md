@@ -9,8 +9,19 @@ scoped packages. The packages share one version and are released together.
   deduplication in core, break the HD/keystore and Solana/x402 runtime import cycles,
   and refresh the deprecated wallet option's removal notice without changing behavior.
 
+### Breaking (SDK)
+
+- `buyRouterBalance` returns `RouterPurchaseResult` with optional typed warnings. `routerPurchaseSummary`, CLI purchase JSON and MCP purchase output allow `amountUsd: null` and `network: "unknown"` when charged metadata is absent.
+- `payRequest` returns the confirmed in-memory receipt with `PaymentWarning` entries when receipt persistence or post-settlement processing fails, instead of rejecting. Callers must retain the receipt and must not retry payment for these warnings.
+- `executeMovement` and `transferBetweenAccounts` take swarm locks before signing or relaying swarm funds and can reject with `SwarmError("swarm_locked")` on contention. Railway `startDetachedRun` rechecks swarm membership and dissolve intent and can reject with swarm validation errors; contention is normalized to the existing `RuntimeError("member_busy")` skip.
+- Core exports `executeTransfer(args, transport?)` as the shared guarded executor and `PaymentWarning` as the common post-settlement warning type. `RouterPurchaseWarning` aliases that type; warning codes now include `receipt_unavailable` and `payment_followup_unavailable`.
+- Movement journals add optional `dissolution` metadata and swarm files add optional `dissolving` intent. Older strict readers can reject these records safely; use the updated SDK to resume them. The reconciliation port is available on `TransferArgs` and `MovementDependencies` as well as `SwarmCapitalDeps`.
+
 ### Fixed
 
+- Every signing or rebroadcast route uses one guarded transfer executor, including ceiling reconciliation and custom transports. Recorded dissolve intent protects legacy member-to-treasury legs and survives gaps between sweeps.
+- Railway member-lock contention remains a `member_busy` skip through the shared swarm lock, preserving members already started in the same run.
+- Confirmed x402 payments return their in-memory receipt and an explicit warning when receipt persistence fails. Router purchases preserve these warnings, including key-store failures, without repeating payment.
 - Confirmed Router purchases always return their receipt. Audit, Router key, and balance follow-up failures are reported as explicit warnings; an unavailable balance is `null`, and CLI/MCP keep the purchase successful.
 - Railway startup reserves and issues member keys under the swarm lock, preventing a launch from racing dissolution or using a member after dissolution completes.
 - Dissolution movements retain their swarm identity. Every execution or resumption checks workers under the swarm lock, and Railway startup refuses unfinished dissolution sweeps, including legacy treasury-to-owner sweeps.
