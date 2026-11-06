@@ -2234,6 +2234,45 @@ describe("vapi swarm railway runs", () => {
     expect(JSON.parse(onlyLine(dissolved.stdout))).toMatchObject({ status: "dissolved" });
   });
 
+  it("guards legacy dissolution through accounts distribute --resume", async () => {
+    const home = await homeWithRailwaySwarm("vapi-cli-distribute-guard-");
+    const transfer = vi.fn<MovementTransfer>(async (args) => ({
+      status: "unknown",
+      from: args.from,
+      to: OWNER,
+      toName: args.to,
+      toKind: "account",
+      amountUsd: String(args.amountUsd),
+      amountAtomic: usdToAtomic(args.amountUsd).toString(),
+      network: BASE_MAINNET_CAIP2,
+      txHash: null,
+      nonce: (args.nonce ?? args.resume)!,
+      replayed: false,
+    }));
+    const deps = {
+      ...railwayDependencies(fakeRailwayExec().exec),
+      swarm: { transfer, balanceReader: async () => 1_000_000n },
+      distribute: { transfer },
+    };
+    const initial = captureIo();
+    expect(await run(["swarm", "dissolve", "team", "--json"], initial.io, deps)).toBe(1);
+    const id = (
+      JSON.parse(onlyLine(initial.stdout)) as { movements: Array<{ movementId: string }> }
+    ).movements[0]!.movementId;
+    const path = join(home, "movements", `${id}.json`);
+    const legacy = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+    delete legacy.dissolution;
+    await writeFile(path, JSON.stringify(legacy));
+    await writeSidecarFile(home, { runId: ORPHAN_RUN, sandboxId: "sbx_9" });
+    transfer.mockClear();
+    const resumed = captureIo();
+    expect(await run(["accounts", "distribute", "--resume", id, "--json"], resumed.io, deps)).toBe(
+      1,
+    );
+    expect(onlyLine(resumed.stdout)).toContain("vapi swarm stop team --all");
+    expect(transfer).not.toHaveBeenCalled();
+  });
+
   it("still lists and destroys the sandboxes of a swarm whose file is gone", async () => {
     const home = await homeWithRailwaySwarm("vapi-swarm-railway-dissolved-sidecar-");
     await writeSidecarFile(home, { runId: ORPHAN_RUN, sandboxId: "sbx_9" });

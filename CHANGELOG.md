@@ -19,6 +19,7 @@ scoped packages. The packages share one version and are released together.
 
 ### Fixed
 
+- Bundled CLI/MCP copies share swarm lock ownership without reacquiring their own lock. Metadata-only backup and account operations retain ordinary account locking.
 - Every signing or rebroadcast route uses one guarded transfer executor, including ceiling reconciliation and custom transports. Recorded dissolve intent protects legacy member-to-treasury legs and survives gaps between sweeps.
 - Railway member-lock contention remains a `member_busy` skip through the shared swarm lock, preserving members already started in the same run.
 - Confirmed x402 payments return their in-memory receipt and an explicit warning when receipt persistence fails. Router purchases preserve these warnings, including key-store failures, without repeating payment.
