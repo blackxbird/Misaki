@@ -235,9 +235,12 @@ export async function executeTransfer(
   const direct = "kind" in args;
   if (!direct) args.signal?.throwIfAborted();
   const home = args.home ?? (direct ? getVapiPaths().directory : args.store.home);
-  const senders = direct ? await sweepAccounts(home, args.account.address) : [args.from];
+  const sender = direct
+    ? await sweepAccounts(home, args.account.address)
+    : { accounts: [args.from], unresolved: [] };
   const accounts = [
-    ...senders,
+    ...sender.accounts,
+    ...sender.unresolved,
     ...(!direct && args.to !== "owner" && walletNameSchema.safeParse(args.to).success
       ? [args.to]
       : []),
@@ -245,49 +248,64 @@ export async function executeTransfer(
   return await withSwarmAccountLocks(home, accounts, async () => {
     // Bind again under the planned locks. A concurrent ownership change must refuse,
     // rather than acquire an undeclared lock after signing has become possible.
-    const currentSenders = direct ? await sweepAccounts(home, args.account.address) : senders;
-    return await withSwarmAccountLocks(home, currentSenders, async () => {
-      for (const swarm of await listSwarms(home)) {
-        if (
-          !swarmAccountNames(swarm).some((name) => currentSenders.includes(name)) ||
-          !(await hasSwarmDissolveIntent(home, swarm.name))
-        )
-          continue;
-        if (!direct) await args.reconcileRuns?.({ home, name: swarm.name });
-        await assertSwarmWorkersStopped(home, swarm);
-      }
-      if (direct)
+    const current = direct ? await sweepAccounts(home, args.account.address) : sender;
+    return await withSwarmAccountLocks(
+      home,
+      [...current.accounts, ...current.unresolved],
+      async () => {
+        for (const swarm of await listSwarms(home)) {
+          const members = swarmAccountNames(swarm);
+          const known = members.some((name) => current.accounts.includes(name));
+          const unresolved = members.some((name) => current.unresolved.includes(name));
+          if (!known && !unresolved) continue;
+          const dissolving = await hasSwarmDissolveIntent(home, swarm.name);
+          if (!direct && dissolving) await args.reconcileRuns?.({ home, name: swarm.name });
+          if (dissolving || unresolved) await assertSwarmWorkersStopped(home, swarm);
+          if (dissolving && unresolved)
+            throw new Error(
+              `Cannot resolve the sweep sender's ownership in dissolving swarm ${swarm.name}. No funds moved.`,
+            );
+        }
+        if (direct)
+          return await (
+            transport === undefined
+              ? broadcastSweep
+              : (transport as (args: SweepBackArgs) => Promise<SweepResult>)
+          )(args);
+        args.signal?.throwIfAborted();
         return await (
-          transport === undefined
-            ? broadcastSweep
-            : (transport as (args: SweepBackArgs) => Promise<SweepResult>)
+          transport === undefined || transport === transferBetweenAccounts
+            ? performTransfer
+            : (transport as (args: TransferArgs) => Promise<TransferResult>)
         )(args);
-      args.signal?.throwIfAborted();
-      return await (
-        transport === undefined || transport === transferBetweenAccounts
-          ? performTransfer
-          : (transport as (args: TransferArgs) => Promise<TransferResult>)
-      )(args);
-    });
+      },
+    );
   });
 }
 
-async function sweepAccounts(home: string, address: string): Promise<string[]> {
-  const accounts: string[] = [];
-  let store: WalletStore | undefined;
+type SweepSender = { accounts: string[]; unresolved: string[] };
+
+async function sweepAccounts(home: string, address: string): Promise<SweepSender> {
+  const store = await WalletStore.open(home);
+  const wallets = await store.list();
+  const same = (value: string | undefined) => value?.toLowerCase() === address.toLowerCase();
+  // Resolve the actual local sender before considering incomplete swarm setup.
+  const accounts = new Set(
+    wallets.filter((wallet) => same(wallet.address)).map((wallet) => wallet.name),
+  );
+  const knownSender = accounts.size > 0;
+  const unresolved = new Set<string>();
   for (const swarm of await listSwarms(home)) {
     for (const member of [swarm.treasury, ...swarm.members]) {
-      const recorded =
-        member.address ??
-        (await (store ??= await WalletStore.open(home)).readAddress(member.account));
-      if (recorded === undefined)
-        throw new Error(
-          `Cannot resolve swarm account ${member.account} before sweeping. No funds moved.`,
-        );
-      if (recorded.toLowerCase() === address.toLowerCase()) accounts.push(member.account);
+      const recorded = member.address ?? (await store.readAddress(member.account));
+      if (same(recorded)) accounts.add(member.account);
+      // Created swarm accounts require an address in the validated journal.
+      // An uncreated planned member cannot be a known ordinary wallet's key;
+      // an unknown signer still needs the executor's intent/worker guard.
+      if (recorded === undefined && !knownSender) unresolved.add(member.account);
     }
   }
-  return accounts;
+  return { accounts: [...accounts], unresolved: [...unresolved] };
 }
 
 // Raw signing/broadcasting stays private to this module, behind executeTransfer.

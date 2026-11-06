@@ -11,6 +11,7 @@ scoped packages. The packages share one version and are released together.
 
 ### Breaking (SDK)
 
+- `RouterClientError` adds `refill_pending`, an optional settled `refill` purchase (fourth constructor argument), and a public `toJSON()` summary. After a settled automatic refill, later key/credential/chat failures retain that purchase and payment-aware retry guidance instead of reporting exhaustion or suggesting another purchase. CLI JSON and MCP errors include its public receipt and warnings.
 - Core exports `withCapitalLocks` and `CapitalLockRequest`. Money operations pre-acquire all required swarm locks by name, then account locks by name; nested requests outside that set reject with `SwarmError("swarm_locked")`. SDK callers composing capital operations must declare the full set up front. Plain account metadata locks preserve their existing busy-account refusal.
 - `executeTransfer` adds a `kind: "direct-sweep"` overload. `sweepBack` exports `SweepBackArgs` with an optional configuration `home`, binds its signer to local swarm accounts and uses the same guarded executor; it can now refuse unresolved ownership, workers or lock contention before any RPC.
 - Router `ChatResult` adds optional `refill: RouterPurchaseResult`; CLI chat JSON and MCP chat output expose its public receipt summary, balance and warnings. A successful automatic refill with an unavailable balance still attempts chat with the balance key.
@@ -23,6 +24,8 @@ scoped packages. The packages share one version and are released together.
 
 ### Fixed
 
+- A first automatic Router refill retains its settled receipt when the console becomes unavailable before its balance key is stored. Chat reports pending key recovery; the next chat request recovers the key without making another purchase. Later credential and chat failures also preserve the purchase.
+- Direct sweeps resolve their actual local sender before considering addressless partial swarm setup. An unrelated uncreated member no longer blocks an ordinary wallet; unresolved sender ownership still refuses on dissolve intent or active workers under the shared guard.
 - Cross-swarm funding acquires the complete connected lock set in one canonical order, preventing opposing transfers from deadlocking. Undeclared nested swarm or account acquisition refuses before signing.
 - Direct CLI/SDK sweeps use the common dissolution guard; raw sweep and relay broadcasters are private to the transfer module.
 - Member-only legacy dissolution journals establish intent even when both newer intent markers are absent.

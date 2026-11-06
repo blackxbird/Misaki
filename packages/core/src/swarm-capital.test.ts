@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getAddress, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 
 import type { DeviceLinkStart } from "./agent-link.js";
 import { readAgentProfile } from "./agent-profile.js";
@@ -1473,6 +1474,75 @@ describe("dissolving a swarm", () => {
     );
     expect(fixture.transfer).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { intent: true, worker: false, blocked: true },
+    { intent: false, worker: true, blocked: true },
+    { intent: false, worker: false, blocked: false },
+  ])(
+    "guards unresolved sweep sender ownership ($intent, $worker)",
+    async ({ intent, worker, blocked }) => {
+      const fixture = await capitalFixture();
+      await writeRawSwarm(fixture.home, {
+        ...fixture.swarm,
+        ...(intent ? { dissolving: true as const } : {}),
+        members: [
+          ...fixture.swarm.members,
+          {
+            account: "team-helper-2",
+            role: "helper",
+            weight: 1,
+            targetAtomic: "1000000",
+            ceilingAtomic: "10000000",
+            steps: {
+              creating: true,
+              created: false,
+              capped: false,
+              profiled: false,
+              linked: false,
+            },
+          },
+        ],
+      });
+      if (worker) {
+        await mkdir(join(fixture.home, "runs"), { recursive: true });
+        await writeFile(
+          join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json"),
+          JSON.stringify({
+            v: 1,
+            swarm: "team",
+            account: "team-helper-2",
+            sandboxId: "sbx_unknown",
+          }),
+        );
+      }
+      const transport = vi.fn(async () => ({
+        network: BASE_MAINNET_CAIP2,
+        amountAtomic: "1000000",
+        transaction: "0xswept",
+      }));
+      const operation = executeTransfer(
+        {
+          kind: "direct-sweep",
+          home: fixture.home,
+          account: privateKeyToAccount(`0x${"12".repeat(32)}`),
+          config: getDefaultConfig(),
+          network: BASE_MAINNET_CAIP2,
+          destination: OWNER,
+        },
+        transport,
+      );
+      if (blocked) {
+        await expect(operation).rejects.toThrow(
+          worker ? "vapi swarm stop team --all" : "Cannot resolve the sweep sender",
+        );
+        expect(transport).not.toHaveBeenCalled();
+      } else {
+        await expect(operation).resolves.toMatchObject({ amountAtomic: "1000000" });
+        expect(transport).toHaveBeenCalledOnce();
+      }
+    },
+  );
 
   it("guards a direct sweep by signer address before any RPC", async () => {
     const fixture = await capitalFixture();

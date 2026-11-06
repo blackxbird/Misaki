@@ -2234,6 +2234,43 @@ describe("vapi swarm railway runs", () => {
     expect(JSON.parse(onlyLine(dissolved.stdout))).toMatchObject({ status: "dissolved" });
   });
 
+  it("sweeps main with an unrelated incomplete swarm present", async () => {
+    const home = await homeWithStoredSwarm("vapi-cli-incomplete-swarm-sweep-");
+    const swarm = await readSwarm(home, "team");
+    await writeSwarm(home, {
+      ...swarm,
+      members: [
+        ...swarm.members,
+        {
+          account: "team-helper-1",
+          role: "helper",
+          weight: 1,
+          targetAtomic: "1000000",
+          ceilingAtomic: "10000000",
+          steps: { creating: false, created: false, capped: false, profiled: false, linked: false },
+        },
+      ],
+    });
+    const sweepBack = vi.fn<NonNullable<CliDependencies["sweepBack"]>>(async ({ network }) => ({
+      network,
+      amountAtomic: "1000000",
+      transaction: "0xswept",
+    }));
+    const captured = captureIo();
+    expect(
+      await run(
+        ["sweep", OWNER, "--wallet", "main", "--network", BASE_MAINNET_CAIP2, "--json"],
+        captured.io,
+        { ...dependencies(), sweepBack },
+      ),
+    ).toBe(0);
+    expect(JSON.parse(onlyLine(captured.stdout))).toMatchObject({
+      wallet: "main",
+      results: [{ status: "swept", amountAtomic: "1000000" }],
+    });
+    expect(sweepBack).toHaveBeenCalledOnce();
+  });
+
   it("guards direct sweep even when a custom sweep transport is injected", async () => {
     const home = await homeWithStoredSwarm("vapi-cli-direct-sweep-guard-");
     await writeSwarm(home, { ...(await readSwarm(home, "team")), dissolving: true });
