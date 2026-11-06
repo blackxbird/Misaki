@@ -63,6 +63,7 @@ import {
   SweepGasError,
   TransferError,
   sweepBack,
+  executeTransfer,
   unlockProtectedVault,
   usesUsdcGas,
   validatePrivateKey,
@@ -71,7 +72,7 @@ import {
   WalletStore,
   writeDefaultConfig,
   writeJsonAtomic,
-  withAccountMovementLock,
+  withCapitalLocks,
   type AuditEvent,
   type CeilingBalanceReader,
   type CeilingSiblingsFetcher,
@@ -2043,7 +2044,7 @@ async function sweepCommand(
   if (requestedNetwork && !isNetworkConfigured(config.networks, requestedNetwork)) {
     throw new Error(`Network ${requestedNetwork} is not configured.`);
   }
-  await withAccountMovementLock(target.store.home, target.name, undefined, async () => {
+  await withCapitalLocks(target.store.home, { accounts: [target.name] }, async () => {
     await target.store.reload();
     const [unfinished] = await listUnfinishedMovements({
       home: target.store.home,
@@ -2067,13 +2068,18 @@ async function sweepCommand(
     const gasErrors: SweepGasError[] = [];
     for (const network of requestedNetwork ? [requestedNetwork] : Object.keys(config.networks)) {
       try {
-        const result = await (dependencies.sweepBack ?? sweepBack)({
-          account,
-          config,
-          network,
-          destination,
-          ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
-        });
+        const result = await executeTransfer(
+          {
+            kind: "direct-sweep",
+            account,
+            config,
+            network,
+            destination,
+            home: target.store.home,
+            ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
+          },
+          dependencies.sweepBack,
+        );
         results.push({ ...result, status: "swept" });
       } catch (error) {
         if (requestedNetwork) throw error;

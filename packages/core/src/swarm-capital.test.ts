@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getAddress, type Hex } from "viem";
@@ -15,6 +16,8 @@ import {
   reconcileUnresolvedMovementsForAccountLocked,
 } from "./movement.js";
 import { withSwarmAccountMovementLocks } from "./account-movement-lock.js";
+import { sweepBack } from "./sweep.js";
+import { getDefaultConfig } from "./config.js";
 import { sweepAboveCeiling } from "./ceiling.js";
 import * as workerGuard from "./swarm-workers.js";
 import { memorySecretStore, type SecretStore } from "./secret-store.js";
@@ -35,6 +38,7 @@ import {
   type TransferResult,
 } from "./transfer.js";
 import { WalletStore } from "./wallet-store.js";
+import { __setAtomicFileTestHooks } from "./atomic-file.js";
 import { ARC_MAINNET_CAIP2, BASE_MAINNET_CAIP2 } from "./x402-networks.js";
 
 const NOW = Date.parse("2026-09-29T10:00:00.000Z");
@@ -44,11 +48,78 @@ const PHRASE = "test test test test test test test test test test test junk";
 const homes: string[] = [];
 
 afterEach(async () => {
+  __setAtomicFileTestHooks(undefined);
   vi.restoreAllMocks();
   await Promise.all(homes.splice(0).map((home) => rm(home, { recursive: true, force: true })));
 });
 
 describe("swarm funding", () => {
+  it("acquires the complete lock set canonically for concurrent A-to-B and B-to-A funding", async () => {
+    const fixture = await capitalFixture();
+    await setupSwarm({
+      store: fixture.store,
+      secrets: fixture.deps.secrets,
+      apiBase: API_BASE,
+      name: "other",
+      roles: ["lead"],
+      surface: "cli",
+      env: {},
+      hostname: "Test Host",
+      now: () => new Date(NOW),
+      startDeviceLink: async (args) => linkStart(args.label),
+      pollDeviceLink: async () => ({
+        owner: OWNER,
+        tokens: {
+          accessToken: "test-access",
+          refreshToken: "test-refresh",
+          expiresAt: NOW + 3_600_000,
+          scopes: ["mcp:call", "router.use"],
+        },
+      }),
+    });
+    fixture.balances.set("team-treasury", 10_000_000n);
+    fixture.balances.set("other-treasury", 10_000_000n);
+    const operation = new AsyncLocalStorage<string>();
+    const order = new Map<string, string[]>();
+    let release!: () => void;
+    const ready = new Promise<void>((done) => {
+      release = done;
+    });
+    __setAtomicFileTestHooks({
+      async beforeLockAttempt(path) {
+        const name = path.endsWith("/.team.lock")
+          ? "team"
+          : path.endsWith("/.other.lock")
+            ? "other"
+            : undefined;
+        const id = operation.getStore();
+        if (name === undefined || id === undefined) return;
+        const seen = order.get(id) ?? [];
+        if (!seen.includes(name)) seen.push(name);
+        order.set(id, seen);
+        if (order.size === 2) release();
+        await ready;
+      },
+    });
+    const outcomes = await Promise.allSettled([
+      operation.run(
+        "A-to-B",
+        async () =>
+          await fundSwarm({ name: "team", from: "other-treasury", amountUsd: 1 }, fixture.deps),
+      ),
+      operation.run(
+        "B-to-A",
+        async () =>
+          await fundSwarm({ name: "other", from: "team-treasury", amountUsd: 1 }, fixture.deps),
+      ),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(2);
+    expect([...order.values()]).toEqual([
+      ["other", "team"],
+      ["other", "team"],
+    ]);
+  }, 10_000);
+
   it("waits for the owner with treasury details and creates no movement", async () => {
     const fixture = await capitalFixture();
 
@@ -1378,6 +1449,59 @@ describe("leaving a swarm", () => {
 });
 
 describe("dissolving a swarm", () => {
+  it("fails closed for a member-only legacy journal with both new markers absent", async () => {
+    const fixture = await capitalFixture();
+    fixture.balances.set("team-lead-1", 1_000_000n);
+    fixture.transfer.mockImplementationOnce(async (args) => transferResult(args, "unknown"));
+    const initial = await dissolveSwarm({ name: "team" }, fixture.deps);
+    const id = initial.movements[0]!.movementId;
+    const movement = await readMovement(fixture.home, id);
+    const { dissolution: _movementMarker, ...legacy } = movement;
+    void _movementMarker;
+    await writeFile(join(fixture.home, "movements", `${id}.json`), JSON.stringify(legacy));
+    const { dissolving: _swarmMarker, ...oldSwarm } = await readSwarm(fixture.home, "team");
+    void _swarmMarker;
+    await writeRawSwarm(fixture.home, oldSwarm);
+    await mkdir(join(fixture.home, "runs"), { recursive: true });
+    await writeFile(
+      join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json"),
+      JSON.stringify({ v: 1, swarm: "team", sandboxId: "sbx_legacy" }),
+    );
+    fixture.transfer.mockClear();
+    await expect(executeMovement({ resume: id }, fixture.deps)).rejects.toThrow(
+      "vapi swarm stop team --all",
+    );
+    expect(fixture.transfer).not.toHaveBeenCalled();
+  });
+
+  it("guards a direct sweep by signer address before any RPC", async () => {
+    const fixture = await capitalFixture();
+    await writeRawSwarm(fixture.home, { ...fixture.swarm, dissolving: true });
+    await mkdir(join(fixture.home, "runs"), { recursive: true });
+    await writeFile(
+      join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json"),
+      JSON.stringify({ v: 1, swarm: "team", sandboxId: "sbx_direct" }),
+    );
+    vi.stubEnv("VAPI_HOME", fixture.home);
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      throw new Error("Unexpected RPC");
+    });
+    try {
+      await expect(
+        sweepBack({
+          account: await fixture.store.unlock("team-lead-1", ""),
+          config: getDefaultConfig(),
+          network: BASE_MAINNET_CAIP2,
+          destination: OWNER,
+          fetchImpl,
+        }),
+      ).rejects.toThrow("vapi swarm stop team --all");
+      expect(fetchImpl).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("guards a new executor caller even with a custom transfer implementation", async () => {
     const fixture = await capitalFixture();
     const swarm = await readSwarm(fixture.home, "team");

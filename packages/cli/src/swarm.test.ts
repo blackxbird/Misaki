@@ -2234,6 +2234,27 @@ describe("vapi swarm railway runs", () => {
     expect(JSON.parse(onlyLine(dissolved.stdout))).toMatchObject({ status: "dissolved" });
   });
 
+  it("guards direct sweep even when a custom sweep transport is injected", async () => {
+    const home = await homeWithStoredSwarm("vapi-cli-direct-sweep-guard-");
+    await writeSwarm(home, { ...(await readSwarm(home, "team")), dissolving: true });
+    await writeSidecarFile(home, { runId: ORPHAN_RUN, sandboxId: "sbx_9" });
+    const sweepBack = vi.fn<NonNullable<CliDependencies["sweepBack"]>>(async ({ network }) => ({
+      network,
+      amountAtomic: "1000000",
+      transaction: "0xpaid",
+    }));
+    const captured = captureIo();
+    expect(
+      await run(
+        ["sweep", OWNER, "--wallet", "team-lead-1", "--network", BASE_MAINNET_CAIP2, "--json"],
+        captured.io,
+        { ...dependencies(), sweepBack },
+      ),
+    ).toBe(1);
+    expect(onlyLine(captured.stdout)).toContain("vapi swarm stop team --all");
+    expect(sweepBack).not.toHaveBeenCalled();
+  });
+
   it("guards legacy dissolution through accounts distribute --resume", async () => {
     const home = await homeWithRailwaySwarm("vapi-cli-distribute-guard-");
     const transfer = vi.fn<MovementTransfer>(async (args) => ({

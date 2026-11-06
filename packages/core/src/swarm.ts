@@ -25,7 +25,7 @@ import { listUnfinishedMovements, readMovement, type MovementSummary } from "./m
 import { configuredNetworkFor, formatUsdc } from "./networks.js";
 import type { SecretStore } from "./secret-store.js";
 import { readUsdcBalance } from "./sweep.js";
-import { trackSwarmLock } from "./swarm-lock-context.js";
+import { capitalLockAccess, trackSwarmLock, withCapitalLocks } from "./swarm-lock-context.js";
 import type { TransferNetwork } from "./transfer.js";
 import { walletNameSchema, type WalletName } from "./wallet-name.js";
 import type { WalletStore } from "./wallet-store.js";
@@ -209,6 +209,10 @@ export async function withSwarmLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   assertName(name);
+  const access = capitalLockAccess(home, "swarm", name);
+  if (access === "outside")
+    return await withCapitalLocks(home, { swarms: [name], metadataOnly: true }, fn);
+  if (access === "reuse") return await fn();
   const path = join(swarmsDirectory(home), `.${name}.lock`);
   let acquired = false;
   try {

@@ -35,12 +35,12 @@ import {
   SWARM_NAME_PATTERN,
   swarmAccountNames,
   SwarmError,
-  withSwarmLock,
   writeSwarm,
   type SwarmBalanceReader,
   type SwarmFile,
   type SwarmMember,
 } from "./swarm.js";
+import { withCapitalLocks } from "./swarm-lock-context.js";
 import { readUsdcBalance } from "./sweep.js";
 import { assertSwarmWorkersStopped } from "./swarm-workers.js";
 import {
@@ -235,7 +235,7 @@ export async function allocateFromTreasury(
     );
   }
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () =>
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
     allocateFromTreasuryLocked(opts, amountCents, deps, home),
   );
 }
@@ -601,7 +601,11 @@ export async function fundSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmFundResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => fundSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(
+    home,
+    { swarms: [opts.name], accounts: opts.from === undefined ? [] : [opts.from] },
+    async () => fundSwarmLocked(opts, deps, home),
+  );
 }
 
 async function fundSwarmLocked(
@@ -853,7 +857,9 @@ export async function rebalanceSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmRebalanceResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => rebalanceSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    rebalanceSwarmLocked(opts, deps, home),
+  );
 }
 
 async function rebalanceSwarmLocked(
@@ -971,7 +977,9 @@ export async function leaveSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmLeaveResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => leaveSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    leaveSwarmLocked(opts, deps, home),
+  );
 }
 
 async function leaveSwarmLocked(
@@ -1067,7 +1075,9 @@ export async function dissolveSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmDissolveResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => dissolveSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    dissolveSwarmLocked(opts, deps, home),
+  );
 }
 
 async function dissolveSwarmLocked(

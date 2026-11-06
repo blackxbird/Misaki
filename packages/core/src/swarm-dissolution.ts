@@ -7,11 +7,16 @@ function recordsDissolveIntent(movement: Movement, swarm: SwarmFile): boolean {
     movement.dissolution === swarm.name ||
     (movement.reason === "sweep" &&
       movement.treasury === swarm.treasury.account &&
-      movement.legs.some((leg) => leg.from === swarm.treasury.account && leg.to === "owner"))
+      movement.legs.some(
+        (leg) =>
+          (leg.from === swarm.treasury.account && leg.to === "owner") ||
+          (swarm.members.some((member) => member.account === leg.from) &&
+            leg.to === swarm.treasury.account),
+      ))
   );
 }
 
-/** Existing marked or treasury-to-owner movements also establish intent after upgrading. */
+/** Pre-marker member sweeps conservatively establish intent too, even without a swarm flag. */
 export async function hasSwarmDissolveIntent(home: string, name: string): Promise<boolean> {
   const swarm = await readSwarm(home, name);
   if (swarm.dissolving === true) return true;

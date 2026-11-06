@@ -3,7 +3,15 @@ import { mkdir, open, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { bytesToHex, getAddress, isAddress, type Address, type Hex } from "viem";
+import {
+  bytesToHex,
+  getAddress,
+  isAddress,
+  createWalletClient,
+  type Hash,
+  type Address,
+  type Hex,
+} from "viem";
 import { z } from "zod";
 
 import { AgentLinkError, agentFetch, withAgentCredentialLock } from "./agent-link.js";
@@ -12,12 +20,33 @@ import { listSwarms, swarmAccountNames } from "./swarm.js";
 import { hasSwarmDissolveIntent } from "./swarm-dissolution.js";
 import { assertSwarmWorkersStopped } from "./swarm-workers.js";
 import { getVapiPaths } from "./config.js";
-import { explorerTransactionUrl } from "./networks.js";
+import {
+  explorerTransactionUrl,
+  configuredNetworkFor,
+  createChain,
+  createNetworkHttpTransport,
+  createNetworkPublicClient,
+  getNetworkDefinition,
+  isSolanaNetwork,
+  requireRpcUrl,
+  usesUsdcGas,
+} from "./networks.js";
+import { sweepSolanaUsdc } from "./svm.js";
+import {
+  calculateSweepAmount,
+  getArcGasHeadroomAtomic,
+  readUsdcBalance,
+  ERC20_ABI,
+  SweepGasError,
+  type SweepBackArgs,
+  type SweepResult,
+} from "./sweep-support.js";
+import { walletNameSchema } from "./wallet-name.js";
 import { appendReceipt, readReceipts, type Receipt } from "./receipts.js";
 import type { SecretStore } from "./secret-store.js";
 import { fetchSiblings, SiblingsError, type Sibling } from "./siblings.js";
 import { releaseSpend, reserveSpend, SpendCapError } from "./spend-policy.js";
-import { spendCapsForWallet, type WalletName, type WalletStore } from "./wallet-store.js";
+import { spendCapsForWallet, type WalletName, WalletStore } from "./wallet-store.js";
 import {
   buildEip3009TypedData,
   type Eip3009Authorization,
@@ -188,28 +217,199 @@ export function parseTransferAmount(value: string | number): {
   return { amountUsd: formatTransferAmount(amountAtomic), amountAtomic };
 }
 
-/** One guarded boundary for signatures and rebroadcasts, including injected transports. */
-export async function executeTransfer(
+/** One guarded boundary for all signatures and broadcasts, including direct sweeps. */
+export function executeTransfer(
+  args: SweepBackArgs & { kind: "direct-sweep" },
+  transport?: (args: SweepBackArgs) => Promise<SweepResult>,
+): Promise<SweepResult>;
+export function executeTransfer(
   args: TransferArgs,
   transport?: (args: TransferArgs) => Promise<TransferResult>,
-): Promise<TransferResult> {
-  args.signal?.throwIfAborted();
-  const home = args.home ?? args.store.home;
-  return await withSwarmAccountLocks(home, [args.from], async () => {
-    for (const swarm of await listSwarms(home)) {
-      if (
-        !swarmAccountNames(swarm).includes(args.from) ||
-        !(await hasSwarmDissolveIntent(home, swarm.name))
-      )
-        continue;
-      await args.reconcileRuns?.({ home, name: swarm.name });
-      await assertSwarmWorkersStopped(home, swarm);
-    }
-    args.signal?.throwIfAborted();
-    return await (
-      transport === undefined || transport === transferBetweenAccounts ? performTransfer : transport
-    )(args);
+): Promise<TransferResult>;
+export async function executeTransfer(
+  args: TransferArgs | (SweepBackArgs & { kind: "direct-sweep" }),
+  transport?:
+    | ((args: TransferArgs) => Promise<TransferResult>)
+    | ((args: SweepBackArgs) => Promise<SweepResult>),
+): Promise<TransferResult | SweepResult> {
+  const direct = "kind" in args;
+  if (!direct) args.signal?.throwIfAborted();
+  const home = args.home ?? (direct ? getVapiPaths().directory : args.store.home);
+  const senders = direct ? await sweepAccounts(home, args.account.address) : [args.from];
+  const accounts = [
+    ...senders,
+    ...(!direct && args.to !== "owner" && walletNameSchema.safeParse(args.to).success
+      ? [args.to]
+      : []),
+  ];
+  return await withSwarmAccountLocks(home, accounts, async () => {
+    // Bind again under the planned locks. A concurrent ownership change must refuse,
+    // rather than acquire an undeclared lock after signing has become possible.
+    const currentSenders = direct ? await sweepAccounts(home, args.account.address) : senders;
+    return await withSwarmAccountLocks(home, currentSenders, async () => {
+      for (const swarm of await listSwarms(home)) {
+        if (
+          !swarmAccountNames(swarm).some((name) => currentSenders.includes(name)) ||
+          !(await hasSwarmDissolveIntent(home, swarm.name))
+        )
+          continue;
+        if (!direct) await args.reconcileRuns?.({ home, name: swarm.name });
+        await assertSwarmWorkersStopped(home, swarm);
+      }
+      if (direct)
+        return await (
+          transport === undefined
+            ? broadcastSweep
+            : (transport as (args: SweepBackArgs) => Promise<SweepResult>)
+        )(args);
+      args.signal?.throwIfAborted();
+      return await (
+        transport === undefined || transport === transferBetweenAccounts
+          ? performTransfer
+          : (transport as (args: TransferArgs) => Promise<TransferResult>)
+      )(args);
+    });
   });
+}
+
+async function sweepAccounts(home: string, address: string): Promise<string[]> {
+  const accounts: string[] = [];
+  let store: WalletStore | undefined;
+  for (const swarm of await listSwarms(home)) {
+    for (const member of [swarm.treasury, ...swarm.members]) {
+      const recorded =
+        member.address ??
+        (await (store ??= await WalletStore.open(home)).readAddress(member.account));
+      if (recorded === undefined)
+        throw new Error(
+          `Cannot resolve swarm account ${member.account} before sweeping. No funds moved.`,
+        );
+      if (recorded.toLowerCase() === address.toLowerCase()) accounts.push(member.account);
+    }
+  }
+  return accounts;
+}
+
+// Raw signing/broadcasting stays private to this module, behind executeTransfer.
+async function broadcastSweep(args: SweepBackArgs): Promise<SweepResult> {
+  const configured = configuredNetworkFor(args.config.networks, args.network);
+  if (!configured) {
+    throw new Error(`Network ${args.network} is not configured.`);
+  }
+
+  if (isSolanaNetwork(args.network)) {
+    if (!args.account.solana) {
+      throw new Error(
+        "Solana is not enabled in this keystore. Run vapi accounts --enable solana first.",
+      );
+    }
+    const result = await sweepSolanaUsdc({
+      network: args.network,
+      configured,
+      signer: args.account.solana,
+      destination: args.destination,
+      allowPrivateNetwork: args.config.allowPrivateNetwork,
+      ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+      ...(args.lookup ? { lookup: args.lookup } : {}),
+    });
+    return {
+      network: args.network,
+      amountAtomic: result.amountAtomic.toString(),
+      transaction: result.transaction,
+    };
+  }
+
+  const definition = getNetworkDefinition(args.network);
+  const balanceAtomic = await readUsdcBalance({
+    network: args.network,
+    configured,
+    address: args.account.address,
+    allowPrivateNetwork: args.config.allowPrivateNetwork,
+    ...(args.fetchImpl ? { fetchImpl: args.fetchImpl } : {}),
+    ...(args.lookup ? { lookup: args.lookup } : {}),
+  });
+  const headroomAtomic = usesUsdcGas(args.network)
+    ? (args.arcGasHeadroomAtomic ?? getArcGasHeadroomAtomic())
+    : 0n;
+  const amountAtomic = calculateSweepAmount(balanceAtomic, headroomAtomic);
+  if (amountAtomic === 0n) {
+    const note =
+      definition.gasToken === "USDC"
+        ? ` after retaining ${headroomAtomic} atomic USDC for Arc gas`
+        : "";
+    throw new Error(`No USDC is available to sweep on ${args.network}${note}.`);
+  }
+
+  const rpcUrl = requireRpcUrl(args.network, configured);
+  const chain = createChain(args.network, rpcUrl);
+  const walletClient = createWalletClient({
+    account: args.account,
+    chain,
+    transport: createNetworkHttpTransport(rpcUrl, {
+      allowPrivateNetwork: args.config.allowPrivateNetwork,
+      ...(args.fetchImpl ? { fetch: args.fetchImpl } : {}),
+      ...(args.lookup ? { lookup: args.lookup } : {}),
+    }),
+  });
+  let transaction: Hash;
+  try {
+    transaction = await walletClient.writeContract({
+      address: getAddress(
+        usesUsdcGas(args.network) ? getNetworkDefinition(args.network).usdc : configured.usdc,
+      ),
+      abi: ERC20_ABI,
+      functionName: "transfer",
+      args: [getAddress(args.destination), amountAtomic],
+    });
+  } catch (error) {
+    if (
+      args.network === BASE_MAINNET_CAIP2 &&
+      !usesUsdcGas(args.network) &&
+      isInsufficientGasError(error)
+    ) {
+      throw new SweepGasError(args.account.address, error);
+    }
+    throw error;
+  }
+  const publicClient = createNetworkPublicClient(args.network, configured, {
+    allowPrivateNetwork: args.config.allowPrivateNetwork,
+    ...(args.fetchImpl ? { fetch: args.fetchImpl } : {}),
+    ...(args.lookup ? { lookup: args.lookup } : {}),
+  });
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: transaction });
+  if (receipt.status !== "success") {
+    throw new Error(`Sweep transaction ${transaction} reverted on ${args.network}.`);
+  }
+
+  return {
+    network: args.network,
+    amountAtomic: amountAtomic.toString(),
+    transaction,
+  };
+}
+
+function isInsufficientGasError(error: unknown): boolean {
+  const seen = new Set<object>();
+  let current: unknown = error;
+  while (typeof current === "object" && current !== null) {
+    if (seen.has(current)) return false;
+    seen.add(current);
+    const record = current as Record<string, unknown>;
+    if (record.name === "InsufficientFundsError") return true;
+    for (const field of ["message", "shortMessage", "details"]) {
+      const value = record[field];
+      if (typeof value !== "string") continue;
+      const normalized = value.toLowerCase();
+      if (
+        normalized.includes("gas required exceeds allowance") ||
+        normalized.includes("insufficient funds")
+      ) {
+        return true;
+      }
+    }
+    current = record.cause;
+  }
+  return false;
 }
 
 export async function transferBetweenAccounts(args: TransferArgs): Promise<TransferResult> {

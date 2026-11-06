@@ -422,8 +422,9 @@ export async function startDetachedRun(args: {
         { timeoutMs: 5_000, lockedMessage: busyMessage },
       );
     if (args.runtime.kind === "railway" && args.member.swarm !== undefined) {
-      // Lock order: swarm, then member, then the adapter's account locks. Hold
-      // the swarm lock through reservation and key issuance, including cleanup.
+      // A launch needs only the swarm and run-reservation locks. Money paths
+      // pre-acquire their entire capital lock set before entering this scope.
+      // Hold the swarm lock through reservation and key issuance, including cleanup.
       return await withSwarmLock(args.home, args.member.swarm, async () => {
         const swarm = await readSwarm(args.home, args.member.swarm!);
         await assertSwarmNotDissolving(args.home, swarm.name);

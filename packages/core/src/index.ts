@@ -113,6 +113,7 @@ export * from "./stats.js";
 export * from "./spend-policy.js";
 export * from "./spend-cap-exceeded.js";
 export * from "./swarm-capital.js";
+export { withCapitalLocks, type CapitalLockRequest } from "./swarm-lock-context.js";
 export { assertSwarmNotDissolving } from "./swarm-dissolution.js";
 export * from "./swarm.js";
 export * from "./status.js";

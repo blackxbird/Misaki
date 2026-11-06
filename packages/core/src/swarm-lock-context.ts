@@ -1,28 +1,170 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
 
-import { listSwarms, swarmAccountNames, withSwarmLock } from "./swarm.js";
+import { withAccountMovementLocks } from "./account-movement-lock.js";
+import { listUnfinishedMovements, readMovement } from "./movement.js";
+import { listSwarms, swarmAccountNames, SwarmError, withSwarmLock } from "./swarm.js";
+import { walletNameSchema } from "./wallet-name.js";
 
-type HeldLock = { home: string; name: string; active: boolean };
-// CLI/MCP tarballs bundle independent core copies. Share ownership context,
-// which contains only paths and lifecycle flags, through Node's symbol registry.
-const registryKey = Symbol.for("@vapi-network/core/swarm-lock-context/v1");
-const registry = globalThis as typeof globalThis & {
-  [registryKey]?: AsyncLocalStorage<HeldLock[]>;
+export type CapitalLockRequest = {
+  swarms?: readonly string[];
+  accounts?: readonly string[];
+  /** Metadata-only operations must not parse or acquire unrelated swarm state. */
+  metadataOnly?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal;
 };
-const heldLocks = (registry[registryKey] ??= new AsyncLocalStorage<HeldLock[]>());
+type LockPlan = {
+  home: string;
+  swarms: Set<string>;
+  accounts: Set<string>;
+  heldSwarms: Set<string>;
+  heldAccounts: Set<string>;
+  active: boolean;
+  phase: "acquiring" | "running";
+  metadataOnly: boolean;
+};
+const registryKey = Symbol.for("@vapi-network/core/capital-lock-plan/v2");
+const registry = globalThis as typeof globalThis & { [registryKey]?: AsyncLocalStorage<LockPlan> };
+const plans = (registry[registryKey] ??= new AsyncLocalStorage<LockPlan>());
 
-/** Internal ownership context: movement execution can reuse its caller's lock. */
+/** Plain metadata locks retain their non-reentrant busy-account contract. */
+export function mayReuseAccountLock(): boolean {
+  return plans.getStore()?.metadataOnly === false;
+}
+
+export function capitalLockAccess(
+  home: string,
+  kind: "swarm" | "account",
+  name: string,
+): "outside" | "acquire" | "reuse" {
+  const plan = plans.getStore();
+  if (!plan?.active) return "outside";
+  const declared = kind === "swarm" ? plan.swarms : plan.accounts;
+  const held = kind === "swarm" ? plan.heldSwarms : plan.heldAccounts;
+  if (
+    plan.home !== resolve(home) ||
+    !declared.has(name) ||
+    (plan.phase === "running" && !held.has(name))
+  ) {
+    throw new SwarmError(
+      "swarm_locked",
+      `The ${kind} ${name} is not in the pre-acquired lock set. Retry the operation with its complete lock set.`,
+    );
+  }
+  return held.has(name) ? "reuse" : "acquire";
+}
+
+async function track<T>(
+  home: string,
+  kind: "swarm" | "account",
+  name: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const plan = plans.getStore();
+  if (!plan?.active || plan.home !== resolve(home))
+    throw new Error("No capital lock plan owns this acquisition.");
+  const held = kind === "swarm" ? plan.heldSwarms : plan.heldAccounts;
+  held.add(name);
+  try {
+    return await operation();
+  } finally {
+    held.delete(name);
+  }
+}
 export async function trackSwarmLock<T>(
   home: string,
   name: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const owner = { home: resolve(home), name, active: true };
+  return await track(home, "swarm", name, operation);
+}
+export async function trackAccountLock<T>(
+  home: string,
+  name: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return await track(home, "account", name, operation);
+}
+
+function addAccount(accounts: Set<string>, name: string): void {
+  if (name !== "owner" && walletNameSchema.safeParse(name).success) accounts.add(name);
+}
+
+/** Plan the whole connected operation before acquiring anything; nested plans may only reuse it. */
+export async function withCapitalLocks<T>(
+  home: string,
+  request: CapitalLockRequest,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const swarms = new Set(request.swarms ?? []);
+  const accounts = new Set(request.accounts ?? []);
+  if (!request.metadataOnly) {
+    const known = await listSwarms(home);
+    const movements = await Promise.all(
+      (await listUnfinishedMovements({ home })).map(
+        async (item) => await readMovement(home, item.id),
+      ),
+    );
+    let previous = "";
+    while (previous !== `${[...swarms].sort()}|${[...accounts].sort()}`) {
+      previous = `${[...swarms].sort()}|${[...accounts].sort()}`;
+      for (const swarm of known) {
+        const members = swarmAccountNames(swarm);
+        if (swarms.has(swarm.name) || members.some((account) => accounts.has(account))) {
+          swarms.add(swarm.name);
+          for (const account of members) accounts.add(account);
+        }
+      }
+      for (const movement of movements) {
+        if (!movement.legs.some((leg) => accounts.has(leg.from) || accounts.has(leg.to))) continue;
+        for (const leg of movement.legs) {
+          addAccount(accounts, leg.from);
+          addAccount(accounts, leg.to);
+        }
+      }
+    }
+  }
+  const existing = plans.getStore();
+  if (existing?.active) {
+    for (const name of swarms)
+      if (capitalLockAccess(home, "swarm", name) !== "reuse")
+        throw new Error("Nested swarm acquisition during lock planning.");
+    for (const name of accounts)
+      if (capitalLockAccess(home, "account", name) !== "reuse")
+        throw new Error("Nested account acquisition during lock planning.");
+    return await operation();
+  }
+  const plan: LockPlan = {
+    home: resolve(home),
+    swarms,
+    accounts,
+    heldSwarms: new Set(),
+    heldAccounts: new Set(),
+    active: true,
+    phase: "acquiring",
+    metadataOnly: request.metadataOnly === true,
+  };
+  // Swarms first (by name), then accounts (by name), in every process.
+  const names = [...swarms].sort();
+  const acquire = async (index: number): Promise<T> => {
+    if (index < names.length)
+      return await withSwarmLock(home, names[index]!, async () => await acquire(index + 1));
+    return await withAccountMovementLocks(
+      home,
+      [...accounts].sort(),
+      request.timeoutMs,
+      async () => {
+        request.signal?.throwIfAborted();
+        plan.phase = "running";
+        return await operation();
+      },
+    );
+  };
   try {
-    return await heldLocks.run([...(heldLocks.getStore() ?? []), owner], operation);
+    return await plans.run(plan, async () => await acquire(0));
   } finally {
-    owner.active = false;
+    plan.active = false;
   }
 }
 
@@ -31,30 +173,12 @@ export async function withSwarmMovementLock<T>(
   name: string,
   operation: () => Promise<T>,
 ): Promise<T> {
-  if (
-    heldLocks
-      .getStore()
-      ?.some((owner) => owner.active && owner.home === resolve(home) && owner.name === name)
-  ) {
-    return await operation();
-  }
-  return await withSwarmLock(home, name, operation);
+  return await withCapitalLocks(home, { swarms: [name] }, operation);
 }
-
-/** Acquire every sender's swarm lock before any account lock, in stable order. */
 export async function withSwarmAccountLocks<T>(
   home: string,
   accounts: readonly string[],
   operation: () => Promise<T>,
 ): Promise<T> {
-  const senders = new Set(accounts);
-  const names = (await listSwarms(home))
-    .filter((swarm) => swarmAccountNames(swarm).some((account) => senders.has(account)))
-    .map((swarm) => swarm.name)
-    .sort();
-  const acquire = async (index: number): Promise<T> =>
-    names[index] === undefined
-      ? await operation()
-      : await withSwarmMovementLock(home, names[index]!, async () => await acquire(index + 1));
-  return await acquire(0);
+  return await withCapitalLocks(home, { accounts }, operation);
 }
