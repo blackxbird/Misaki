@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
   createRunId,
   FileLockedError,
+  SwarmError,
   isRunId,
   readSwarm,
   RUN_ID_PATTERN,
@@ -437,7 +438,12 @@ export async function startDetachedRun(args: {
     }
     return await launch();
   } catch (error) {
-    if (error instanceof FileLockedError) throw new RuntimeError("member_busy", busyMessage);
+    if (
+      error instanceof FileLockedError ||
+      (error instanceof SwarmError && error.code === "swarm_locked")
+    ) {
+      throw new RuntimeError("member_busy", busyMessage);
+    }
     throw error;
   }
 }
