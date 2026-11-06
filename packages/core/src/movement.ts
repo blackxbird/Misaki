@@ -15,13 +15,9 @@ import { explorerAddressUrl } from "./networks.js";
 import type { Receipt } from "./receipts.js";
 import type { SecretStore } from "./secret-store.js";
 import { releaseSpend } from "./spend-policy.js";
-import { dissolutionSwarm } from "./swarm-dissolution.js";
-import { withSwarmMovementLock } from "./swarm-lock-context.js";
-import { assertSwarmWorkersStopped } from "./swarm-workers.js";
-import { readSwarm } from "./swarm.js";
 import { readTransferJournal, type TransferJournal } from "./transfer-journal.js";
 import {
-  transferBetweenAccounts,
+  executeTransfer,
   TransferError,
   type TransferArgs,
   type TransferNetwork,
@@ -156,6 +152,7 @@ export type MovementDependencies = {
   lockTimeoutMs?: number;
   replaceExpiredRestored?: boolean;
   bindLegacyAddresses?: boolean;
+  reconcileRuns?: TransferArgs["reconcileRuns"];
 };
 
 export class MovementError extends Error {
@@ -183,16 +180,6 @@ export async function executeMovement(
   plan: MovementPlan | { resume: string },
   deps: MovementDependencies,
 ): Promise<Movement> {
-  const home = deps.home ?? deps.store.home;
-  const initial = "resume" in plan ? await readMovement(home, parseMovementId(plan.resume)) : plan;
-  const swarm = await dissolutionSwarm(home, initial);
-  if (swarm !== undefined) {
-    // Always acquire the swarm lock before any sender/account movement lock.
-    return await withSwarmMovementLock(home, swarm.name, async () => {
-      await assertSwarmWorkersStopped(home, await readSwarm(home, swarm.name));
-      return await executeMovementLocked(plan, deps);
-    });
-  }
   return await executeMovementLocked(plan, deps);
 }
 
@@ -898,28 +885,31 @@ async function callTransfer(
   } else if (!resume) {
     throw movementAddressUnboundError(movement);
   }
-  const transfer = deps.transfer ?? transferBetweenAccounts;
   const sweepParent = await readSweepParent(movement, leg, deps);
-  return await transfer({
-    store: deps.store,
-    secrets: deps.secrets,
-    apiBase: deps.apiBase,
-    from: leg.from,
-    to: leg.to,
-    amountUsd: leg.amountUsd,
-    network: movement.network,
-    purpose: leg.purpose,
-    expectedFromAddress: leg.fromAddress,
-    expectedToAddress: leg.toAddress,
-    ...(sweepParent === undefined ? {} : { sweepParent }),
-    home: deps.home ?? deps.store.home,
-    ...(resume ? { resume: leg.nonce as Hex } : { nonce: leg.nonce as Hex }),
-    ...(deps.unlock === undefined ? {} : { unlock: deps.unlock }),
-    ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
-    ...(deps.now === undefined ? {} : { now: deps.now }),
-    ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
-    ...(deps.ledgerPath === undefined ? {} : { ledgerPath: deps.ledgerPath }),
-  });
+  return await executeTransfer(
+    {
+      store: deps.store,
+      secrets: deps.secrets,
+      apiBase: deps.apiBase,
+      from: leg.from,
+      to: leg.to,
+      amountUsd: leg.amountUsd,
+      network: movement.network,
+      purpose: leg.purpose,
+      expectedFromAddress: leg.fromAddress,
+      expectedToAddress: leg.toAddress,
+      ...(sweepParent === undefined ? {} : { sweepParent }),
+      home: deps.home ?? deps.store.home,
+      ...(resume ? { resume: leg.nonce as Hex } : { nonce: leg.nonce as Hex }),
+      ...(deps.unlock === undefined ? {} : { unlock: deps.unlock }),
+      ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+      ...(deps.now === undefined ? {} : { now: deps.now }),
+      ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
+      ...(deps.ledgerPath === undefined ? {} : { ledgerPath: deps.ledgerPath }),
+      ...(deps.reconcileRuns === undefined ? {} : { reconcileRuns: deps.reconcileRuns }),
+    },
+    deps.transfer,
+  );
 }
 
 async function reconcileCrash(movement: Movement, index: number, home: string): Promise<void> {
@@ -1517,36 +1507,22 @@ export function serializeMovement(movement: Movement): string {
   return `${JSON.stringify(movementSchema.parse(movement), null, 2)}\n`;
 }
 
-async function withMovementLock<T>(
-  home: string,
-  from: WalletName,
-  timeoutMs: number | undefined,
-  operation: () => Promise<T>,
-): Promise<T> {
-  try {
-    return await withAccountMovementLocks(home, [from], timeoutMs, operation);
-  } catch (error) {
-    if (error instanceof AccountMovementLockedError) {
-      throw new MovementError(
-        "movement_locked",
-        `Another movement is already running for account ${from}.`,
-      );
-    }
-    throw error;
-  }
-}
-
 async function withMovementLocks<T>(
   home: string,
   senders: readonly WalletName[],
   timeoutMs: number | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const [sender, ...remaining] = senders;
-  if (sender === undefined) return await operation();
-  return await withMovementLock(home, sender, timeoutMs, async () =>
-    withMovementLocks(home, remaining, timeoutMs, operation),
-  );
+  try {
+    return await withAccountMovementLocks(home, senders, timeoutMs, operation);
+  } catch (error) {
+    if (error instanceof AccountMovementLockedError)
+      throw new MovementError(
+        "movement_locked",
+        `Another movement is already running for account ${error.account}.`,
+      );
+    throw error;
+  }
 }
 
 async function assertNoPendingCeilingSweep(

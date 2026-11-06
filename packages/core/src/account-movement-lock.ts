@@ -4,6 +4,7 @@ import type { FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 
 import { isMissingFile } from "./config.js";
+import { withSwarmAccountLocks } from "./swarm-lock-context.js";
 import type { WalletName } from "./wallet-name.js";
 
 export class AccountMovementLockedError extends Error {
@@ -17,6 +18,20 @@ export class AccountMovementLockedError extends Error {
 
 /** Serializes every signer that can create an EIP-3009 authorization for one account. */
 export async function withAccountMovementLock<T>(
+  home: string,
+  account: WalletName,
+  timeoutMs: number | undefined,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  return await withSwarmAccountLocks(
+    home,
+    [account],
+    async () => await withAccountMovementLockOnly(home, account, timeoutMs, operation, signal),
+  );
+}
+
+async function withAccountMovementLockOnly<T>(
   home: string,
   account: WalletName,
   timeoutMs: number | undefined,
@@ -63,11 +78,11 @@ export async function withAccountMovementLocks<T>(
   timeoutMs: number | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
-  return await acquireAccountMovementLocks(
+  return await withSwarmAccountLocks(
     home,
-    [...new Set(accounts)].sort(),
-    timeoutMs,
-    operation,
+    accounts,
+    async () =>
+      await acquireAccountMovementLocks(home, [...new Set(accounts)].sort(), timeoutMs, operation),
   );
 }
 
@@ -79,7 +94,7 @@ async function acquireAccountMovementLocks<T>(
 ): Promise<T> {
   const [account, ...remaining] = accounts;
   if (account === undefined) return await operation();
-  return await withAccountMovementLock(home, account, timeoutMs, async () =>
+  return await withAccountMovementLockOnly(home, account, timeoutMs, async () =>
     acquireAccountMovementLocks(home, remaining, timeoutMs, operation),
   );
 }

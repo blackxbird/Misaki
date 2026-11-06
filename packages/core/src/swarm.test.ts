@@ -8,6 +8,7 @@ import { createAccount } from "./account-add.js";
 import type { DeviceLinkStart, LinkResult } from "./agent-link.js";
 import { readAgentProfile, writeAgentProfile } from "./agent-profile.js";
 import { DEFAULT_SPEND_CAPS } from "./config.js";
+import { FileLockedError } from "./atomic-file.js";
 import type { Movement } from "./movement.js";
 import type { SecretStore } from "./secret-store.js";
 import {
@@ -25,6 +26,7 @@ import {
   swarmParentResolver,
   swarmStatus,
   writeSwarm,
+  withSwarmLock,
   type SetupSwarmOptions,
   type SwarmFile,
 } from "./swarm.js";
@@ -39,6 +41,17 @@ const homes: string[] = [];
 
 afterEach(async () => {
   await Promise.all(homes.splice(0).map((home) => rm(home, { recursive: true, force: true })));
+});
+
+it("preserves a nested lock error without relabeling it as swarm contention", async () => {
+  const home = await mkdtemp(join(tmpdir(), "vapi-swarm-nested-lock-"));
+  homes.push(home);
+  const nested = new FileLockedError("member busy");
+  await expect(
+    withSwarmLock(home, "team", async () => {
+      throw nested;
+    }),
+  ).rejects.toBe(nested);
 });
 
 async function fixture(): Promise<

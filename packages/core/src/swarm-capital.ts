@@ -43,7 +43,6 @@ import {
 } from "./swarm.js";
 import { readUsdcBalance } from "./sweep.js";
 import { assertSwarmWorkersStopped } from "./swarm-workers.js";
-import { dissolutionSwarm } from "./swarm-dissolution.js";
 import {
   transferBetweenAccounts,
   TransferError,
@@ -58,8 +57,6 @@ export type SwarmCapitalDeps = MovementDependencies & {
   balanceReader?: SwarmBalanceReader;
   config?: VapiConfig;
   reconcileCeilingSweep?: (account: WalletName) => Promise<CeilingSweepResult>;
-  /** Refresh durable worker state before dissolution; absent adapters fail closed. */
-  reconcileRuns?: (input: { home: string; name: string }) => Promise<void>;
 };
 
 export type SwarmLegResult = {
@@ -1081,6 +1078,8 @@ async function dissolveSwarmLocked(
   const swarm = await readSwarm(home, opts.name);
   await deps.reconcileRuns?.({ home, name: swarm.name });
   await assertSwarmWorkersStopped(home, swarm);
+  swarm.dissolving = true;
+  await writeSwarm(home, swarm);
   await assertSwarmAccountAddresses(swarm, deps);
   await reconcilePendingCeilingSweeps(swarm, swarmAccountNames(swarm), deps, home);
   const resumed = await resumeOrBlock(swarm, deps, home);
@@ -1773,8 +1772,6 @@ async function resumeOrBlock(
   const resumable = movements.resumable[0];
   if (resumable === undefined) return undefined;
   const movement = await readMovement(home, resumable.id);
-  if (await dissolutionSwarm(home, movement))
-    await deps.reconcileRuns?.({ home, name: swarm.name });
   return movementResult(
     resumable.id === swarm.setupFunding?.policy?.movementId
       ? await resumeSetupPolicyMovement(movement, deps, home)
@@ -1794,8 +1791,6 @@ async function resumeOrBlockOther(
   if (blocking !== undefined) throw unfinishedMovementError(swarm, blocking.id);
   const resumable = movements.resumable.find((movement) => !recordedIds.has(movement.id));
   if (resumable === undefined) return undefined;
-  if (await dissolutionSwarm(home, await readMovement(home, resumable.id)))
-    await deps.reconcileRuns?.({ home, name: swarm.name });
   return movementResult(
     await executeMovement({ resume: resumable.id }, movementDeps(deps, home)),
     true,

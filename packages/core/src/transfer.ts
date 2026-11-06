@@ -7,6 +7,10 @@ import { bytesToHex, getAddress, isAddress, type Address, type Hex } from "viem"
 import { z } from "zod";
 
 import { AgentLinkError, agentFetch, withAgentCredentialLock } from "./agent-link.js";
+import { withSwarmAccountLocks } from "./swarm-lock-context.js";
+import { listSwarms, swarmAccountNames } from "./swarm.js";
+import { hasSwarmDissolveIntent } from "./swarm-dissolution.js";
+import { assertSwarmWorkersStopped } from "./swarm-workers.js";
 import { getVapiPaths } from "./config.js";
 import { explorerTransactionUrl } from "./networks.js";
 import { appendReceipt, readReceipts, type Receipt } from "./receipts.js";
@@ -55,6 +59,8 @@ export type TransferArgs = {
   signal?: AbortSignal;
   ledgerPath?: string;
   home?: string;
+  /** Reconcile worker records before the shared executor checks dissolution eligibility. */
+  reconcileRuns?: (input: { home: string; name: string }) => Promise<void>;
 };
 export type TransferResult = {
   status: "sent" | "unknown";
@@ -182,7 +188,33 @@ export function parseTransferAmount(value: string | number): {
   return { amountUsd: formatTransferAmount(amountAtomic), amountAtomic };
 }
 
+/** One guarded boundary for signatures and rebroadcasts, including injected transports. */
+export async function executeTransfer(
+  args: TransferArgs,
+  transport?: (args: TransferArgs) => Promise<TransferResult>,
+): Promise<TransferResult> {
+  const home = args.home ?? args.store.home;
+  return await withSwarmAccountLocks(home, [args.from], async () => {
+    for (const swarm of await listSwarms(home)) {
+      if (
+        !swarmAccountNames(swarm).includes(args.from) ||
+        !(await hasSwarmDissolveIntent(home, swarm.name))
+      )
+        continue;
+      await args.reconcileRuns?.({ home, name: swarm.name });
+      await assertSwarmWorkersStopped(home, swarm);
+    }
+    return await (
+      transport === undefined || transport === transferBetweenAccounts ? performTransfer : transport
+    )(args);
+  });
+}
+
 export async function transferBetweenAccounts(args: TransferArgs): Promise<TransferResult> {
+  return await executeTransfer(args);
+}
+
+async function performTransfer(args: TransferArgs): Promise<TransferResult> {
   args.signal?.throwIfAborted();
   const { amountUsd, amountAtomic } = parseTransferAmount(args.amountUsd);
   const { network, identity } = resolveNetwork(args.network);

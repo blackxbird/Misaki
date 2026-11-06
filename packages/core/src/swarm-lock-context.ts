@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
 
-import { withSwarmLock } from "./swarm.js";
+import { listSwarms, swarmAccountNames, withSwarmLock } from "./swarm.js";
 
 type HeldLock = { home: string; name: string; active: boolean };
 const heldLocks = new AsyncLocalStorage<HeldLock[]>();
@@ -33,4 +33,22 @@ export async function withSwarmMovementLock<T>(
     return await operation();
   }
   return await withSwarmLock(home, name, operation);
+}
+
+/** Acquire every sender's swarm lock before any account lock, in stable order. */
+export async function withSwarmAccountLocks<T>(
+  home: string,
+  accounts: readonly string[],
+  operation: () => Promise<T>,
+): Promise<T> {
+  const senders = new Set(accounts);
+  const names = (await listSwarms(home))
+    .filter((swarm) => swarmAccountNames(swarm).some((account) => senders.has(account)))
+    .map((swarm) => swarm.name)
+    .sort();
+  const acquire = async (index: number): Promise<T> =>
+    names[index] === undefined
+      ? await operation()
+      : await withSwarmMovementLock(home, names[index]!, async () => await acquire(index + 1));
+  return await acquire(0);
 }

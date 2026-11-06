@@ -108,6 +108,8 @@ export const swarmFileSchema = z
     treasury: treasurySchema,
     members: z.array(memberSchema),
     setupFunding: setupFundingSchema.optional(),
+    /** Durable intent survives legacy legs and gaps between dissolution sweeps. */
+    dissolving: z.literal(true).optional(),
     policy: z.strictObject({
       strategy: z.enum(["targets", "even", "weights"]),
       treasuryCaps: capsSchema,
@@ -208,12 +210,21 @@ export async function withSwarmLock<T>(
 ): Promise<T> {
   assertName(name);
   const path = join(swarmsDirectory(home), `.${name}.lock`);
+  let acquired = false;
   try {
-    return await withFileLock(path, async () => await trackSwarmLock(home, name, fn), {
-      lockedMessage: `Swarm ${name} is locked.`,
-    });
+    return await withFileLock(
+      path,
+      async () => {
+        acquired = true;
+        return await trackSwarmLock(home, name, fn);
+      },
+      {
+        lockedMessage: `Swarm ${name} is locked.`,
+      },
+    );
   } catch (error) {
-    if (error instanceof FileLockedError) throw new SwarmError("swarm_locked", error.message);
+    if (!acquired && error instanceof FileLockedError)
+      throw new SwarmError("swarm_locked", error.message);
     throw error;
   }
 }
