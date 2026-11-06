@@ -373,6 +373,50 @@ describe("vapi router buy", () => {
 });
 
 describe("vapi router chat", () => {
+  it("preserves settled refill evidence in chat errors and payment-aware guidance", async () => {
+    await initializedHome();
+    const purchase = {
+      ...purchaseResult(null),
+      warnings: [{ code: "router_key_unavailable" as const, message: "Key recovery is pending." }],
+    };
+    const message =
+      "Payment settled, but the Router balance key is not yet available. It will be fetched on the next request.";
+    const dependencies = commandDependencies({
+      router: {
+        routerChat: async () => {
+          throw new RouterClientError("refill_pending", message, undefined, purchase);
+        },
+      },
+    });
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi", "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(1);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      error: message,
+      code: "refill_pending",
+      exitCode: 1,
+      refill: {
+        receipt: { id: "router-receipt", amountUsd: 5 },
+        balance: null,
+        warnings: purchase.warnings,
+      },
+    });
+    const human = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi"],
+        human.io,
+        dependencies,
+      ),
+    ).toBe(1);
+    expect(human.stderr).toContain(message);
+  });
+
   it("keeps auto-refill warnings in chat JSON and human diagnostics", async () => {
     await initializedHome();
     const refill = {

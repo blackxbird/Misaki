@@ -239,6 +239,90 @@ function usageResponse() {
 }
 
 describe("routerChat", () => {
+  it.each(["console", "credentials", "chat-http", "chat-budget", "chat-key"] as const)(
+    "retains the FIRST settled refill across later %s failure and recovers without paying again",
+    async (failure) => {
+      let paid = 0;
+      let failLater = true;
+      const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+        if (url.host === "router.example") {
+          if (headers.get("authorization") === `Bearer ${ROUTER_KEY}`)
+            return new Response("Budget has been exceeded", { status: 429 });
+          expect(headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+          if (failLater && failure.startsWith("chat-"))
+            return new Response(
+              failure === "chat-budget" ? "Budget has been exceeded" : "unavailable",
+              {
+                status: failure === "chat-budget" ? 429 : failure === "chat-key" ? 401 : 503,
+              },
+            );
+          return Response.json({ choices: [{ message: { content: "chat recovered" } }] });
+        }
+        if (url.pathname === "/api/router/top-up/1") {
+          if (!headers.has("payment-signature")) return topupRequired(1);
+          paid++;
+          return topupAccepted(1);
+        }
+        if (paid > 0 && failLater && failure === "console")
+          throw new Error("private-console-error-must-not-leak");
+        if (url.pathname === "/api/agents/self/router-balance-key")
+          return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+        if (url.pathname === "/api/agents/self/router")
+          return Response.json({
+            ...usageResponse(),
+            balance: { purchasedUsd: paid, spentUsd: 0, remainingUsd: paid },
+          });
+        throw new Error(`Unexpected test URL ${url}`);
+      });
+      const deps = await linkedDeps(fetchImpl, { routerRefill: { belowUsd: 1, tierUsd: 1 } });
+      const balanceAccount = agentSecretAccounts("main").routerBalance;
+      expect(deps.secrets.entries[balanceAccount]).toBeUndefined();
+      const originalGet = deps.secrets.get;
+      deps.secrets.get = async (name) => {
+        if (
+          failure === "credentials" &&
+          failLater &&
+          name === balanceAccount &&
+          deps.secrets.entries[name]
+        )
+          throw new Error("private-keystore-error-must-not-leak");
+        return await originalGet(name);
+      };
+      const options = { ...deps, refill: refillOptions(deps.wallets) };
+      const error = await routerChat(options, { model: "model", messages: [] }).catch(
+        (error: unknown) => error,
+      );
+      expect(error).toBeInstanceOf(RouterClientError);
+      expect(error).toMatchObject({
+        code: "refill_pending",
+        refill: { receipt: { outcome: "paid", settlement: { outcome: "succeeded" } } },
+      });
+      expect((error as Error).message).toContain("Payment settled");
+      expect((error as Error).message).not.toMatch(/buy|top-up/i);
+      expect(JSON.stringify(error)).not.toContain("private-");
+      if (failure === "console") {
+        expect((error as Error).message).toContain("key is not yet available");
+        expect((error as Error).message).toContain("next request");
+        expect(error).toMatchObject({
+          refill: {
+            balance: null,
+            warnings: [{ code: "router_key_unavailable" }, { code: "balance_unavailable" }],
+          },
+        });
+      }
+      expect(paid).toBe(1);
+      failLater = false;
+      await expect(routerChat(deps, { model: "model", messages: [] })).resolves.toMatchObject({
+        content: "chat recovered",
+        keyUsed: "balance",
+      });
+      expect(deps.secrets.entries[balanceAccount]).toBe(BALANCE_KEY);
+      expect(paid).toBe(1);
+    },
+  );
+
   it("continues chat and returns the paid refill warning when post-payment usage is unavailable", async () => {
     let chats = 0;
     let usageCalls = 0;

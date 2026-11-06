@@ -44,7 +44,7 @@ import {
   type VapiConfig,
   type WalletStore,
 } from "@vapi-network/core";
-import { routerChat as coreRouterChat } from "@vapi-network/core/router-client";
+import { routerChat as coreRouterChat, RouterClientError } from "@vapi-network/core/router-client";
 import { z } from "zod";
 
 import { accountsSend } from "./actions/accounts.js";
@@ -1568,6 +1568,15 @@ export async function loadServerConfig() {
 }
 
 export function toolError(error: unknown) {
+  if (error instanceof RouterClientError && error.refill !== undefined) {
+    const payload = error.toJSON();
+    return {
+      isError: true as const,
+      structuredContent: payload,
+      content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+    };
+  }
+
   const spendCapError = serializeSpendCapError(error);
   const text =
     spendCapError !== undefined

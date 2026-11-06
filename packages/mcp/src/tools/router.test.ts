@@ -282,6 +282,49 @@ describe("vAPI Router MCP tools", () => {
     await server.close();
   });
 
+  it("preserves settled refill evidence in payment-aware chat errors without private fields", async () => {
+    const purchase = {
+      receipt: {
+        id: "paid-first-refill",
+        timestamp: RESET_TIME,
+        resourceUrl: "https://api.example/topup",
+        quote: { amountAtomic: "1000000", network: "eip155:8453" },
+        secret: "hidden",
+      },
+      balance: null,
+      warnings: [
+        {
+          code: "router_key_unavailable" as const,
+          message: "Key recovery is pending.",
+          secret: "hidden",
+        },
+      ],
+    };
+    const message =
+      "Payment settled, but the Router balance key is not yet available. It will be fetched on the next request.";
+    const { server } = await routerServer({
+      routerChat: async () => {
+        throw new RouterClientError("refill_pending", message, undefined, purchase);
+      },
+    });
+    const result = await server.callTool({
+      name: "router.chat",
+      arguments: { model: "m", messages: [{ role: "user", content: "hi" }] },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      code: "refill_pending",
+      message,
+      refill: {
+        receipt: { id: "paid-first-refill", amountUsd: 1 },
+        balance: null,
+        warnings: [{ code: "router_key_unavailable" }],
+      },
+    });
+    expectPublicValue(result);
+    await server.close();
+  });
+
   it("returns auto-refill warnings with successful chat without private fields", async () => {
     const refill = {
       receipt: {
