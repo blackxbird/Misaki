@@ -42,6 +42,7 @@ import {
   type SwarmMember,
 } from "./swarm.js";
 import { readUsdcBalance } from "./sweep.js";
+import { assertSwarmWorkersStopped } from "./swarm-workers.js";
 import {
   transferBetweenAccounts,
   TransferError,
@@ -56,6 +57,8 @@ export type SwarmCapitalDeps = MovementDependencies & {
   balanceReader?: SwarmBalanceReader;
   config?: VapiConfig;
   reconcileCeilingSweep?: (account: WalletName) => Promise<CeilingSweepResult>;
+  /** Refresh durable worker state before dissolution; absent adapters fail closed. */
+  reconcileRuns?: (input: { home: string; name: string }) => Promise<void>;
 };
 
 export type SwarmLegResult = {
@@ -1075,6 +1078,8 @@ async function dissolveSwarmLocked(
   home: string,
 ): Promise<SwarmDissolveResult> {
   const swarm = await readSwarm(home, opts.name);
+  await deps.reconcileRuns?.({ home, name: swarm.name });
+  await assertSwarmWorkersStopped(home, swarm);
   await assertSwarmAccountAddresses(swarm, deps);
   await reconcilePendingCeilingSweeps(swarm, swarmAccountNames(swarm), deps, home);
   const resumed = await resumeOrBlock(swarm, deps, home);

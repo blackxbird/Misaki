@@ -376,49 +376,9 @@ async function dissolveCommand(
   const parsed = parseArguments(argv, { valueOptions: new Set(), maximumPositionals: 1 });
   const name = requiredPositional(parsed.positionals[0], "<name>", DISSOLVE_USAGE);
   const context = await commandContext(dependencies, io);
-  await assertNoRemoteSandboxes(context.store.home, name, dependencies);
   const result = await dissolveSwarm({ name }, capitalDependencies(context, dependencies));
   outputCapital(result, json, io);
   return result.status === "dissolved" ? 0 : 1;
-}
-
-/**
- * Dissolving a swarm must not strand a sandbox that holds a member key: while a
- * railway run is running or a railway sidecar of this swarm exists, dissolve
- * refuses and names the stop command. The refresh first destroys the sandboxes
- * of finished runs, exactly as `vapi swarm runs` does.
- */
-async function assertNoRemoteSandboxes(
-  home: string,
-  name: string,
-  dependencies: CliDependencies,
-): Promise<void> {
-  const records = await refreshedSwarmRecords(home, name, dependencies);
-  const running = records.filter(
-    (record) =>
-      record.kind === "railway" && (record.state === "starting" || record.state === "running"),
-  );
-  const runIds = new Set(running.map((record) => record.runId));
-  const sidecars = (await listRailwaySidecars(home)).filter(
-    (sidecar) => sidecar.swarm === name && !runIds.has(sidecar.runId),
-  );
-  if (running.length === 0 && sidecars.length === 0) return;
-  const sandboxes = [
-    ...running.map(
-      (record) => `${record.member.account} (run ${record.runId}, sandbox ${record.handle.ref})`,
-    ),
-    ...sidecars.map(
-      (sidecar) =>
-        `${sidecar.account || "a member"} (run ${sidecar.runId}, ${sidecar.sandboxId === undefined ? "sandbox id unknown" : `sandbox ${sidecar.sandboxId}`})`,
-    ),
-  ];
-  throw new Error(
-    [
-      `Swarm ${name} still has Railway sandboxes that may hold a member key: ${sandboxes.join(", ")}.`,
-      `Stop them first with: vapi swarm stop ${name} --all`,
-      "Then dissolve again. Nothing was moved.",
-    ].join("\n"),
-  );
 }
 
 /**
@@ -1014,6 +974,9 @@ function capitalDependencies(
     },
     ...(dependencies.now === undefined ? {} : { now: () => dependencies.now!().getTime() }),
     ...capitalSeams,
+    reconcileRuns: async ({ home, name }) => {
+      await refreshedSwarmRecords(home, name, dependencies);
+    },
   };
 }
 

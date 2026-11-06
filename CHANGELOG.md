@@ -9,6 +9,11 @@ scoped packages. The packages share one version and are released together.
   deduplication in core, break the HD/keystore and Solana/x402 runtime import cycles,
   and refresh the deprecated wallet option's removal notice without changing behavior.
 
+### Fixed
+
+- Swarm dissolution checks tracked Railway runs and sandboxes in core before moving funds. MCP now refuses active or unresolved remote workers with the same stop guidance as the CLI.
+- Router purchases report the charged quote amount and use settlement network evidence when the quote is absent. CLI and MCP report unknown metadata without guessing a network or returning an error after a successful payment.
+
 ## 0.12.0 — 2026-10-30
 
 ### Added

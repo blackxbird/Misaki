@@ -14,6 +14,7 @@ import { sweepAboveCeiling } from "./ceiling.js";
 import type { SpendCaps, VapiConfig } from "./config.js";
 import type { VapiPaymentAccount } from "./keystore.js";
 import { createPublicFetch } from "./net-guard.js";
+import { formatUsdc } from "./networks.js";
 import type { Receipt } from "./receipts.js";
 import type { RunBudget } from "./run-budget.js";
 import type { SecretStore } from "./secret-store.js";
@@ -220,6 +221,24 @@ export async function routerUsage(deps: RouterClientDeps): Promise<AgentRouterUs
   return parsed.data;
 }
 
+/** Public facts about a completed purchase, without guessing from its requested tier. */
+export function routerPurchaseSummary(receipt: Receipt): {
+  amountUsd: number | null;
+  network: string;
+} {
+  const atomic = receipt.quote?.amountAtomic;
+  const amount =
+    atomic !== undefined && /^\d+$/u.test(atomic) ? Number(formatUsdc(BigInt(atomic))) : null;
+  const settlement = z
+    .object({ network: z.string().trim().min(1) })
+    .safeParse(receipt.settlement?.evidence);
+  return {
+    amountUsd: amount !== null && Number.isFinite(amount) ? amount : null,
+    network:
+      receipt.quote?.network?.trim() || (settlement.success ? settlement.data.network : "unknown"),
+  };
+}
+
 export async function buyRouterBalance(
   deps: RouterClientDeps & {
     account: VapiPaymentAccount;
@@ -284,6 +303,7 @@ export async function buyRouterBalance(
     );
   }
 
+  const purchase = routerPurchaseSummary(receipt);
   await appendAudit(
     deps.wallets.home,
     {
@@ -291,7 +311,7 @@ export async function buyRouterBalance(
       wallet: deps.wallet,
       owner: link.owner,
       tty: Boolean(process.stderr.isTTY),
-      detail: `$${tierUsd} on ${receipt.quote?.network ?? "eip155:8453"}`,
+      detail: `${purchase.amountUsd === null ? "amount unknown" : `$${purchase.amountUsd}`} on ${purchase.network}`,
     },
     deps.now === undefined ? {} : { now: () => deps.now! },
   );

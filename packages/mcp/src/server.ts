@@ -821,6 +821,12 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     ...(options.ledgerPath === undefined ? {} : { ledgerPath: options.ledgerPath }),
     ...(accountsOptions.now === undefined ? {} : { now: accountsOptions.now }),
     ...options.swarm,
+    reconcileRuns: async ({ home, name }) => {
+      const records = await listRunRecords(home, { swarm: name });
+      for (const record of records) {
+        await refreshRunRecord(home, record, options.runtime);
+      }
+    },
     unlock: async (account) => {
       const selected = await session.payment(account);
       return {

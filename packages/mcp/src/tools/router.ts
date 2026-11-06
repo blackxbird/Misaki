@@ -6,6 +6,7 @@ import {
   ownerStake,
   routerChat,
   routerUsage,
+  routerPurchaseSummary,
   type AgentRouterUsage,
   type RouterClientDeps,
 } from "@vapi-network/core/router-client";
@@ -105,7 +106,7 @@ export const routerBuyTool = {
   outputSchema: z.object({
     receipt: z.object({
       id: z.string(),
-      amountUsd: z.number(),
+      amountUsd: z.number().nullable(),
       network: z.string(),
       transaction: z.string().optional(),
     }),
@@ -233,14 +234,11 @@ export function createRouterTools(options: RouterToolsOptions): {
         },
         parsed.usd,
       );
-      const network = result.receipt.quote?.network;
-      if (network === undefined) {
-        throw new Error("The Router balance purchase receipt did not identify its network.");
-      }
+      const { amountUsd, network } = routerPurchaseSummary(result.receipt);
       return toolResult({
         receipt: {
           id: result.receipt.id,
-          amountUsd: parsed.usd,
+          amountUsd,
           network,
           ...(result.receipt.settlement?.transaction === undefined
             ? {}

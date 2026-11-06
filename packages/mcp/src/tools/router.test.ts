@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { WalletStore, getDefaultConfig, type SecretStore } from "@vapi-network/core";
+import { WalletStore, getDefaultConfig, type Receipt, type SecretStore } from "@vapi-network/core";
 import {
   RouterClientError,
   type AgentRouterUsage,
@@ -292,6 +292,60 @@ describe("vAPI Router MCP tools", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     await server.close();
   });
+
+  it.each([
+    {
+      label: "the charged quote rather than the requested tier",
+      quote: { network: "eip155:5042", amountAtomic: "4750000" },
+      evidence: { network: "eip155:8453" },
+      amountUsd: 4.75,
+      network: "eip155:5042",
+    },
+    {
+      label: "settlement evidence when the quote is absent",
+      quote: undefined,
+      evidence: { network: "eip155:5042" },
+      amountUsd: null,
+      network: "eip155:5042",
+    },
+    {
+      label: "unknown values when payment metadata is absent",
+      quote: undefined,
+      evidence: undefined,
+      amountUsd: null,
+      network: "unknown",
+    },
+  ])(
+    "reports $label after a successful purchase",
+    async ({ quote, evidence, amountUsd, network }) => {
+      const receipt: Receipt = {
+        id: "receipt-router-5",
+        timestamp: "2026-09-23T12:00:00.000Z",
+        resourceUrl: `${API_BASE}api/router/top-up/5`,
+        quote,
+        settlement: { outcome: "succeeded", evidence },
+      };
+      const buyRouterBalance = vi.fn<NonNullable<RouterOverrides["buyRouterBalance"]>>(
+        async () => ({
+          receipt,
+          balance: null,
+        }),
+      );
+      const { server, store } = await routerServer({ buyRouterBalance });
+      await store.setSpendCaps("main", { perCallAtomic: "50000000", perDayAtomic: "50000000" });
+
+      const result = await server.callTool({ name: "router.buy", arguments: { usd: 5 } });
+
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(result.structuredContent).toEqual({
+        receipt: { id: receipt.id, amountUsd, network },
+        balance: null,
+      });
+      expect(buyRouterBalance).toHaveBeenCalledTimes(1);
+      expectPublicValue(result);
+      await server.close();
+    },
+  );
 
   it("buys through the injected core seam and returns only a public receipt summary", async () => {
     const buyRouterBalance = vi.fn<NonNullable<RouterOverrides["buyRouterBalance"]>>(async () => ({

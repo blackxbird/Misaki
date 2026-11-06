@@ -1,7 +1,6 @@
 import {
   SpendCapError,
   SpendCapExceededError,
-  formatUsdc,
   getNetworkDefinition,
   getVapiPaths,
   loadConfig,
@@ -16,6 +15,7 @@ import {
   routerChat,
   routerCredentials,
   routerUsage,
+  routerPurchaseSummary,
   type RouterClientDeps,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
@@ -256,9 +256,7 @@ async function buyCommand(
     throw error;
   }
 
-  const amountAtomic = result.receipt.quote?.amountAtomic ?? String(tierUsd * 1_000_000);
-  const amountUsd = Number(formatUsdc(BigInt(amountAtomic)));
-  const network = result.receipt.quote?.network ?? "eip155:8453";
+  const { amountUsd, network } = routerPurchaseSummary(result.receipt);
   const transaction = result.receipt.settlement?.transaction;
   const summary = {
     tierUsd,
@@ -273,10 +271,14 @@ async function buyCommand(
     return;
   }
   const networkName = networkDisplayName(network);
+  const payment =
+    amountUsd === null
+      ? `Payment succeeded on ${networkName}; charged amount unknown.`
+      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}.`;
   io.stdout(
     result.balance === null
-      ? `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance is not visible yet.`
-      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance: $${money(result.balance.remainingUsd)}.`,
+      ? `${payment} Router balance is not visible yet.`
+      : `${payment} Router balance: $${money(result.balance.remainingUsd)}.`,
   );
 }
 

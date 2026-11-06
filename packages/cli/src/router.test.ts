@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SpendCapError,
   SpendCapExceededError,
+  type Receipt,
   type SecretStore,
   WalletStore,
 } from "@vapi-network/core";
@@ -103,6 +104,64 @@ describe("vapi router usage", () => {
 });
 
 describe("vapi router buy", () => {
+  it.each([
+    {
+      label: "the charged quote rather than the requested tier",
+      quote: { network: "eip155:5042", amountAtomic: "4750000" },
+      evidence: { network: "eip155:8453" },
+      amountUsd: 4.75,
+      network: "eip155:5042",
+    },
+    {
+      label: "settlement evidence when the quote is absent",
+      quote: undefined,
+      evidence: { network: "eip155:5042" },
+      amountUsd: null,
+      network: "eip155:5042",
+    },
+    {
+      label: "unknown values when payment metadata is absent",
+      quote: undefined,
+      evidence: undefined,
+      amountUsd: null,
+      network: "unknown",
+    },
+  ])(
+    "reports $label after a successful purchase",
+    async ({ quote, evidence, amountUsd, network }) => {
+      await initializedHome();
+      const receipt: Receipt = {
+        ...purchaseResult().receipt,
+        quote,
+        settlement: { outcome: "succeeded", transaction: "0xtransaction", evidence },
+      };
+      const buy = vi.fn<typeof buyRouterBalance>(async () => ({ receipt, balance: null }));
+      const dependencies = {
+        ...commandDependencies(),
+        router: { buyRouterBalance: buy },
+      };
+      const captured = captureIo();
+
+      expect(
+        await runCli(
+          ["router", "buy", "5", "--wallet", WALLET, "--json"],
+          captured.io,
+          dependencies,
+        ),
+      ).toBe(0);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({ amountUsd, network, tierUsd: 5 });
+      expect(buy).toHaveBeenCalledTimes(1);
+
+      const human = captureIo();
+      expect(await runCli(["router", "buy", "5", "--wallet", WALLET], human.io, dependencies)).toBe(
+        0,
+      );
+      expect(human.stdout.join("\n")).toContain(
+        amountUsd === null ? "charged amount unknown" : "Paid $4.75 USDC",
+      );
+    },
+  );
+
   it("unlocks the wallet, applies its spend caps, and prints the paid balance", async () => {
     await initializedHome();
     const buy = vi.fn<typeof buyRouterBalance>(async () => purchaseResult());
