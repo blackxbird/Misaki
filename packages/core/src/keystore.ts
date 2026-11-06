@@ -14,6 +14,7 @@ import { z } from "zod";
 import type { Hex } from "viem";
 
 import { getVapiPaths, isMissingFile, migrateLegacyVapiHome } from "./config.js";
+import { KeystoreError } from "./keystore-error.js";
 import {
   deriveEvmPrivateKey,
   deriveSolanaPrivateKey,
@@ -25,6 +26,8 @@ import {
   SOLANA_DERIVATION_PATH,
   validateRecoveryPhrase,
 } from "./hd.js";
+
+export { KeystoreError } from "./keystore-error.js";
 
 const SCRYPT_N = 2 ** 15;
 const SCRYPT_R = 8;
@@ -130,13 +133,6 @@ export type CreateKeystoreOptions = {
   /** Restore an existing wallet instead of generating a new phrase. */
   phrase?: string;
 };
-
-export class KeystoreError extends Error {
-  constructor(message: string, options?: ErrorOptions) {
-    super(message, options);
-    this.name = "KeystoreError";
-  }
-}
 
 /**
  * AES-256-GCM encryption with a fresh 12-byte nonce and a 16-byte tag.

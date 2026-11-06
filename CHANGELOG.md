@@ -5,6 +5,10 @@ scoped packages. The packages share one version and are released together.
 
 ## Unreleased
 
+- Internal: use current path helpers and declared Tasks entry points, share provenance
+  deduplication in core, break the HD/keystore and Solana/x402 runtime import cycles,
+  and refresh the deprecated wallet option's removal notice without changing behavior.
+
 ## 0.12.0 — 2026-10-30
 
 ### Added

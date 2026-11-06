@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 
 import { z } from "zod";
 
-import { getAgentCashPaths, isMissingFile, type SpendCaps } from "./config.js";
+import { getVapiPaths, isMissingFile, type SpendCaps } from "./config.js";
 import { DEFAULT_WALLET_NAME, walletNameSchema, type WalletName } from "./wallet-name.js";
 
 const ledgerSchema = z.object({
@@ -68,7 +68,7 @@ export function utcDateKey(now = new Date()): string {
 
 /** Today's spend for one wallet. Other wallets and older days read as zero. */
 export async function readSpendLedger(
-  path = getAgentCashPaths().ledger,
+  path = getVapiPaths().ledger,
   now = new Date(),
   wallet: WalletName = DEFAULT_WALLET_NAME,
 ): Promise<SpendLedger> {
@@ -127,7 +127,7 @@ function sumTaskReservations(
 
 /** Today's spend of every wallet that has spent today. */
 export async function readSpendLedgerRows(
-  path = getAgentCashPaths().ledger,
+  path = getVapiPaths().ledger,
   now = new Date(),
 ): Promise<SpendLedgerRow[]> {
   return (await readStoredSpendLedgerRows(path, now)).map(({ date, spentAtomic, wallet }) => ({
@@ -220,7 +220,7 @@ export async function reserveSpend(
     }
   }
 
-  const ledgerPath = options?.ledgerPath ?? getAgentCashPaths().ledger;
+  const ledgerPath = options?.ledgerPath ?? getVapiPaths().ledger;
   const now = options?.now ?? new Date();
   const wallet = options?.wallet ?? DEFAULT_WALLET_NAME;
   return await withLedgerLock(ledgerPath, async () => {
@@ -417,7 +417,7 @@ export async function releaseSpend(
     throw new Error("Spend amount cannot be negative.");
   }
 
-  const ledgerPath = options.ledgerPath ?? getAgentCashPaths().ledger;
+  const ledgerPath = options.ledgerPath ?? getVapiPaths().ledger;
   const now = options.now ?? new Date();
   const wallet = options.wallet ?? DEFAULT_WALLET_NAME;
   return await withLedgerLock(ledgerPath, async () => {

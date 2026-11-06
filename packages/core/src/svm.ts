@@ -1,4 +1,3 @@
-import { discardBody } from "./x402.js";
 import {
   address,
   appendTransactionMessageInstructions,
@@ -19,6 +18,7 @@ import {
 } from "@solana-program/token";
 
 import type { LookupFn } from "./net-guard.js";
+import { discardBody } from "./http-response.js";
 import { createPublicFetch } from "./net-guard.js";
 import type { ConfiguredNetwork } from "./networks.js";
 import { requireRpcUrl, SOLANA_MAINNET_USDC, USDC_DECIMALS } from "./networks.js";
