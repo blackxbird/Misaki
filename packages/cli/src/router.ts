@@ -265,6 +265,9 @@ async function buyCommand(
     ...(transaction === undefined ? {} : { transaction }),
     receiptId: result.receipt.id,
     balance: result.balance,
+    ...(result.warnings === undefined
+      ? {}
+      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
   };
   if (json) {
     io.stdout(JSON.stringify(summary));
@@ -280,6 +283,7 @@ async function buyCommand(
       ? `${payment} Router balance is not visible yet.`
       : `${payment} Router balance: $${money(result.balance.remainingUsd)}.`,
   );
+  for (const warning of result.warnings ?? []) io.stderr(warning.message);
 }
 
 async function keyCommand(

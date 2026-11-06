@@ -35,6 +35,7 @@ import { SpendCapExceededError } from "./spend-cap-exceeded.js";
 import { readSpendLedger } from "./spend-policy.js";
 import { BASE_MAINNET_CAIP2 } from "./x402-networks.js";
 import { WalletStore, type AgentLink } from "./wallet-store.js";
+import { purchaseTransport } from "../../../test-fixtures/router-purchase.js";
 
 const API_BASE = "https://console.example";
 const ROUTER_BASE = "https://router.example/gateway/";
@@ -1008,15 +1009,16 @@ describe("buyRouterBalance", () => {
           router_base_url: "https://other-router.example",
         });
       }
+      if (url.pathname === "/api/agents/self/router") return Response.json(usageResponse());
       throw new Error(`Unexpected test URL ${url.origin}${url.pathname}`);
     });
     const deps = await linkedDeps(fetchImpl);
 
     await expect(
       buyRouterBalance({ ...deps, ...refillOptions(deps.wallets) }, 1),
-    ).rejects.toMatchObject({
-      code: "http",
-      message: expect.stringMatching(/payment went through.*next chat\/buy/iu),
+    ).resolves.toMatchObject({
+      receipt: { outcome: "paid" },
+      warnings: [{ code: "router_key_unavailable" }],
     });
     expect(deps.secrets.entries[agentSecretAccounts("main").routerBalance]).toBeUndefined();
     expect(await readFile(join(deps.wallets.home, "receipts.jsonl"), "utf8")).toContain(
@@ -1058,6 +1060,58 @@ describe("buyRouterBalance", () => {
     expect(balanceKeyCalls).toBe(2);
     expect(deps.secrets.entries[agentSecretAccounts("main").routerBalance]).toBe(BALANCE_KEY);
   });
+});
+
+describe("confirmed Router purchases", () => {
+  it.each(["audit", "key", "balance", "all", "response"] as const)(
+    "returns the paid receipt when %s follow-up fails",
+    async (failure) => {
+      const deps = await linkedDeps(vi.fn());
+      const { fetchImpl, calls } = purchaseTransport(deps.wallets.home, failure, ROUTER_BASE);
+      const result = await buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl },
+        5,
+      );
+      expect(calls.paid).toBe(1);
+      expect(result.receipt).toMatchObject({
+        outcome: "paid",
+        settlement: { outcome: "succeeded" },
+        quote: { amountAtomic: "4750000" },
+      });
+      expect(result).toMatchObject({
+        warnings:
+          failure === "all"
+            ? [
+                { code: "audit_unavailable" },
+                { code: "router_key_unavailable" },
+                { code: "balance_unavailable" },
+              ]
+            : [
+                {
+                  code:
+                    failure === "response"
+                      ? "purchase_response_unavailable"
+                      : failure === "audit"
+                        ? "audit_unavailable"
+                        : failure === "key"
+                          ? "router_key_unavailable"
+                          : "balance_unavailable",
+                },
+              ],
+      });
+      expect(calls.key).toBe(1);
+      expect(calls.balance).toBe(1);
+      expect(result.balance).toEqual(
+        failure === "balance" || failure === "all"
+          ? null
+          : { purchasedUsd: 5, spentUsd: 0, remainingUsd: 5 },
+      );
+      expect((await readReceipts(join(deps.wallets.home, "receipts.jsonl")))[0]?.id).toBe(
+        result.receipt.id,
+      );
+      expect(JSON.stringify(result)).not.toContain("private-follow-up-error-must-not-leak");
+    },
+  );
 });
 
 describe("console Router endpoints", () => {

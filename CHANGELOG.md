@@ -11,6 +11,7 @@ scoped packages. The packages share one version and are released together.
 
 ### Fixed
 
+- Confirmed Router purchases always return their receipt. Audit, Router key, and balance follow-up failures are reported as explicit warnings; an unavailable balance is `null`, and CLI/MCP keep the purchase successful.
 - Railway startup reserves and issues member keys under the swarm lock, preventing a launch from racing dissolution or using a member after dissolution completes.
 - Dissolution movements retain their swarm identity. Every execution or resumption checks workers under the swarm lock, and Railway startup refuses unfinished dissolution sweeps, including legacy treasury-to-owner sweeps.
 - Swarm dissolution checks tracked Railway runs and sandboxes in core before moving funds. MCP now refuses active or unresolved remote workers with the same stop guidance as the CLI.

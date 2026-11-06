@@ -111,6 +111,19 @@ export const routerBuyTool = {
       transaction: z.string().optional(),
     }),
     balance: routerUsageSchema.balance,
+    warnings: z
+      .array(
+        z.object({
+          code: z.enum([
+            "audit_unavailable",
+            "router_key_unavailable",
+            "balance_unavailable",
+            "purchase_response_unavailable",
+          ]),
+          message: z.string(),
+        }),
+      )
+      .optional(),
   }),
 };
 
@@ -245,6 +258,9 @@ export function createRouterTools(options: RouterToolsOptions): {
             : { transaction: result.receipt.settlement.transaction }),
         },
         balance: publicBalance(result.balance),
+        ...(result.warnings === undefined
+          ? {}
+          : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
       });
     },
   };

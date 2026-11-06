@@ -11,6 +11,8 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createVapiServer, type VapiServerOptions } from "../server.js";
+import { purchaseTransport } from "../../../../test-fixtures/router-purchase.js";
+import { agentSecretAccounts } from "@vapi-network/core/agent-link";
 
 const API_BASE = "https://console.example.test/";
 const RESET_TIME = "2026-09-24T00:00:00.000Z";
@@ -29,6 +31,73 @@ afterEach(async () => {
 });
 
 describe("vAPI Router MCP tools", () => {
+  it.each(["audit", "key", "balance"] as const)(
+    "returns success through real payment when %s follow-up fails",
+    async (failure) => {
+      const home = await mkdtemp(join(tmpdir(), "vapi-router-paid-"));
+      temporaryDirectories.push(home);
+      const secrets = memoryStore();
+      const store = await WalletStore.open(home, { secrets });
+      const main = await store.create("main", "", {
+        phrase: "test test test test test test test test test test test junk",
+      });
+      await store.setSpendCaps("main", { perCallAtomic: "5000000", perDayAtomic: "20000000" });
+      await store.setLink("main", {
+        apiBase: API_BASE,
+        clientId: "agent_main",
+        owner: OWNER,
+        label: "main",
+        scopes: ["mcp:call", "router.use"],
+        linkedAt: "2026-11-06T00:00:00.000Z",
+        routerBaseUrl: "https://router.example",
+      });
+      await secrets.set(
+        agentSecretAccounts("main").tokens,
+        JSON.stringify({
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Number.MAX_SAFE_INTEGER,
+          scopes: ["mcp:call", "router.use"],
+        }),
+      );
+      const { fetchImpl, calls } = purchaseTransport(home, failure);
+      const config = getDefaultConfig({});
+      config.allowPrivateNetwork = true;
+      const server = createVapiServer({
+        account: main.account,
+        config,
+        store,
+        secretStore: secrets,
+        env: {},
+        fetchImpl,
+        ledgerPath: join(home, "spend-ledger.json"),
+        receiptsPath: join(home, "receipts.jsonl"),
+      });
+      try {
+        const result = await server.callTool({ name: "router.buy", arguments: { usd: 5 } });
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(calls.paid).toBe(1);
+        expect(result.structuredContent).toMatchObject({
+          receipt: { amountUsd: 4.75 },
+          warnings: [
+            {
+              code:
+                failure === "audit"
+                  ? "audit_unavailable"
+                  : failure === "key"
+                    ? "router_key_unavailable"
+                    : "balance_unavailable",
+            },
+          ],
+        });
+        expectPublicValue(result);
+        expect(JSON.stringify(result)).not.toContain("private-follow-up-error-must-not-leak");
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
   it("registers only the four public Router tools with secret-safe schemas and descriptions", async () => {
     const { server } = await routerServer();
     const { tools } = await server.listTools();

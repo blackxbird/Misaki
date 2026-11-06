@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SpendCapError,
   SpendCapExceededError,
+  getDefaultConfig,
   type Receipt,
   type SecretStore,
   WalletStore,
@@ -23,6 +24,7 @@ import {
 } from "@vapi-network/core/router-client";
 
 import { runCli, type CliDependencies, type CliIo } from "./cli.js";
+import { purchaseTransport } from "../../../test-fixtures/router-purchase.js";
 
 const PASSPHRASE = "test-only-passphrase";
 const WALLET = "researcher";
@@ -104,6 +106,47 @@ describe("vapi router usage", () => {
 });
 
 describe("vapi router buy", () => {
+  it.each(["audit", "key", "balance"] as const)(
+    "returns success through real payment when %s follow-up fails",
+    async (failure) => {
+      const dependencies = await linkedRouterDependencies(
+        async (input, init) => await transport.fetchImpl(input, init),
+      );
+      const home = process.env.VAPI_HOME!;
+      const transport = purchaseTransport(home, failure);
+      await writeFile(
+        join(home, "config.json"),
+        JSON.stringify({ ...getDefaultConfig({}), allowPrivateNetwork: true }),
+      );
+      const store = await WalletStore.open(home, { secrets: currentSecretStore() });
+      await store.setSpendCaps(WALLET, { perCallAtomic: "5000000", perDayAtomic: "20000000" });
+      const captured = captureIo();
+      expect(
+        await runCli(
+          ["router", "buy", "5", "--wallet", WALLET, "--json"],
+          captured.io,
+          dependencies,
+        ),
+      ).toBe(0);
+      expect(transport.calls.paid).toBe(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        amountUsd: 4.75,
+        receiptId: expect.any(String),
+        warnings: [
+          {
+            code:
+              failure === "audit"
+                ? "audit_unavailable"
+                : failure === "key"
+                  ? "router_key_unavailable"
+                  : "balance_unavailable",
+          },
+        ],
+      });
+      expect(allOutput(captured)).not.toContain("private-follow-up-error-must-not-leak");
+    },
+  );
+
   it.each([
     {
       label: "the charged quote rather than the requested tier",

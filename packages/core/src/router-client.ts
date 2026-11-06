@@ -239,6 +239,22 @@ export function routerPurchaseSummary(receipt: Receipt): {
   };
 }
 
+export type RouterPurchaseWarning = {
+  code:
+    | "audit_unavailable"
+    | "router_key_unavailable"
+    | "balance_unavailable"
+    | "purchase_response_unavailable";
+  message: string;
+};
+
+export type RouterPurchaseResult = {
+  receipt: Receipt;
+  balance: AgentRouterUsage["balance"];
+  /** Post-payment failures; the receipt remains authoritative. Never retry the purchase for these. */
+  warnings?: RouterPurchaseWarning[];
+};
+
 export async function buyRouterBalance(
   deps: RouterClientDeps & {
     account: VapiPaymentAccount;
@@ -251,7 +267,7 @@ export async function buyRouterBalance(
     run?: RunRef;
   },
   tierUsd: RouterTopupTier,
-): Promise<{ receipt: Receipt; balance: AgentRouterUsage["balance"] }> {
+): Promise<RouterPurchaseResult> {
   if (!isRouterTopupTier(tierUsd)) {
     throw new RouterClientError("http", "Router balance must use a $1, $5, $20, or $50 tier.");
   }
@@ -294,7 +310,7 @@ export async function buyRouterBalance(
         }),
     },
   });
-  if (!response.ok) {
+  if (!response.ok && receipt.settlement?.outcome !== "succeeded") {
     if (response.status === 401) await verifyAgentLink(deps);
     throw new RouterClientError(
       "http",
@@ -303,29 +319,55 @@ export async function buyRouterBalance(
     );
   }
 
-  const purchase = routerPurchaseSummary(receipt);
-  await appendAudit(
-    deps.wallets.home,
-    {
-      event: "router.buy",
-      wallet: deps.wallet,
-      owner: link.owner,
-      tty: Boolean(process.stderr.isTTY),
-      detail: `${purchase.amountUsd === null ? "amount unknown" : `$${purchase.amountUsd}`} on ${purchase.network}`,
-    },
-    deps.now === undefined ? {} : { now: () => deps.now! },
-  );
+  const warnings: RouterPurchaseWarning[] = [];
+  if (!response.ok)
+    warnings.push({
+      code: "purchase_response_unavailable",
+      message:
+        "Payment succeeded, but the Router purchase response was unsuccessful. Keep the returned receipt and check vapi router usage; do not repeat the purchase.",
+    });
+  try {
+    const purchase = routerPurchaseSummary(receipt);
+    await appendAudit(
+      deps.wallets.home,
+      {
+        event: "router.buy",
+        wallet: deps.wallet,
+        owner: link.owner,
+        tty: Boolean(process.stderr.isTTY),
+        detail: `${purchase.amountUsd === null ? "amount unknown" : `$${purchase.amountUsd}`} on ${purchase.network}`,
+      },
+      deps.now === undefined ? {} : { now: () => deps.now! },
+    );
+  } catch {
+    warnings.push({
+      code: "audit_unavailable",
+      message:
+        "Payment succeeded, but the local purchase audit could not be written. Keep the returned receipt; do not repeat the purchase.",
+    });
+  }
 
   try {
     await ensureBalanceRouterKey(deps, link);
   } catch {
-    throw new RouterClientError(
-      "http",
-      "The Router balance payment went through, but its key could not be fetched or stored. It can be fetched on the next chat/buy.",
-    );
+    warnings.push({
+      code: "router_key_unavailable",
+      message:
+        "Payment succeeded, but its Router balance key could not be fetched or stored. Retry chat to fetch the key; do not repeat the purchase.",
+    });
   }
 
-  return { receipt, balance: (await routerUsage(deps)).balance };
+  let balance: AgentRouterUsage["balance"] = null;
+  try {
+    balance = (await routerUsage(deps)).balance;
+  } catch {
+    warnings.push({
+      code: "balance_unavailable",
+      message:
+        "Payment succeeded, but the Router balance is unavailable. Check vapi router usage before buying again.",
+    });
+  }
+  return { receipt, balance, ...(warnings.length === 0 ? {} : { warnings }) };
 }
 
 export async function routerChat(
