@@ -1,5 +1,4 @@
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
 
 import {
   activeAgentMarker,
@@ -26,8 +25,6 @@ import {
   swarmStatus,
   usdToAtomic,
   writeJsonAtomic,
-  withFileLock,
-  FileLockedError,
   type AccountLinkOutcome,
   type SwarmCapitalDeps,
   type SwarmLegResult,
@@ -48,6 +45,7 @@ import {
   stopRun,
   summarizeRunRecord,
   writeRunRecord,
+  withMemberRunLock,
   type AgentEvent,
   type DetachedRunSummary,
   type RunRecord,
@@ -850,112 +848,96 @@ async function forgetRunCommand(
   if (account === undefined || account === "")
     throw new RuntimeError("run_not_found", `Run ${runId} was not found for swarm ${name}.`);
   assertWalletName(account);
-  const busyMessage = `Member ${account} is changing run state.`;
-  try {
-    return await withFileLock(
-      join(home, "runs", `.member-${account}.lock`),
-      async () => {
-        let record = await readRunRecord(home, runId);
-        const recoveredOrphan = record === undefined;
-        const sidecar = (await listRailwaySidecars(home)).find((item) => item.runId === runId);
-        if (
-          record !== undefined &&
-          (record.member.account !== account || record.member.swarm !== name)
-        )
-          throw new RuntimeError("run_not_found", `Run ${runId} was not found for swarm ${name}.`);
-        if (
-          sidecar !== undefined &&
-          ((sidecar.account !== "" && sidecar.account !== account) ||
-            (sidecar.swarm !== "" && sidecar.swarm !== name) ||
-            (record?.handle.ref &&
-              sidecar.sandboxId !== undefined &&
-              record.handle.ref !== sidecar.sandboxId))
-        )
-          throw new RuntimeError(
-            "runtime_unavailable",
-            `Run ${runId} has a mismatched Railway sidecar; nothing was forgotten.`,
-          );
-        if (record === undefined) {
-          if (sidecar?.state !== "orphaned")
-            throw new RuntimeError(
-              "runtime_unavailable",
-              "Only an unknown or orphaned Railway run can be forgotten.",
-            );
-          const recoveredAt = (dependencies.now?.() ?? new Date()).toISOString();
-          const member = { swarm: name, account, profile: account };
-          record = {
-            v: 1,
-            runId,
-            kind: "railway",
-            member,
-            run: { runId, task: "Recovered orphaned Railway sandbox", mode: "agent" },
-            handle: {
-              runId,
-              kind: "railway",
-              member,
-              startedAt: recoveredAt,
-              ref: sidecar.sandboxId ?? "",
-            },
-            startedAt: recoveredAt,
-            state: "orphaned",
-            detail:
-              "Recovered from an orphaned Railway sidecar; original start time and scope were not recorded.",
-          };
-        }
-        if (
-          record.kind !== "railway" ||
-          (record.state !== "unknown" && record.state !== "orphaned")
-        )
-          throw new RuntimeError(
-            "runtime_unavailable",
-            "Only an unknown or orphaned Railway run can be forgotten.",
-          );
-        const sandboxId = record.handle.ref || sidecar?.sandboxId || null;
-        const projectId = record.handle.railwayScope?.projectId ?? null;
-        const environmentId = record.handle.railwayScope?.environmentId ?? null;
-        const shellWord = (value: string) =>
-          /^[A-Za-z0-9_.:-]+$/u.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
-        const check = `railway sandbox list --project ${projectId === null ? "<original-project>" : shellWord(projectId)} --environment ${environmentId === null ? "<original-environment>" : shellWord(environmentId)}`;
-        const forgottenAt = (dependencies.now?.() ?? new Date()).toISOString();
-        io.stderr(`Sandbox: ${sandboxId ?? "not recorded"}`);
-        io.stderr(`Original Railway project: ${projectId ?? "not recorded"}`);
-        io.stderr(`Original Railway environment: ${environmentId ?? "not recorded"}`);
-        io.stderr(`Verify destruction in that scope with: ${check}`);
-        // Keep a blocking record before retiring an orphan-only sidecar. A failed
-        // final write leaves this record unresolved and eligible for a later retry.
-        if (recoveredOrphan) await writeRunRecord(home, record);
-        if (sidecar !== undefined) await rm(railwaySidecarPath(home, runId), { force: true });
-        const forgotten: RunRecord = {
-          ...record,
-          state: "forgotten",
-          forgottenAt,
-          confirmedBy: "cli",
-        };
-        await writeRunRecord(home, forgotten);
-        const result = {
-          swarm: name,
+  return await withMemberRunLock(home, account, async () => {
+    let record = await readRunRecord(home, runId);
+    const recoveredOrphan = record === undefined;
+    const sidecar = (await listRailwaySidecars(home)).find((item) => item.runId === runId);
+    if (record !== undefined && (record.member.account !== account || record.member.swarm !== name))
+      throw new RuntimeError("run_not_found", `Run ${runId} was not found for swarm ${name}.`);
+    if (
+      sidecar !== undefined &&
+      ((sidecar.account !== "" && sidecar.account !== account) ||
+        (sidecar.swarm !== "" && sidecar.swarm !== name) ||
+        (record?.handle.ref &&
+          sidecar.sandboxId !== undefined &&
+          record.handle.ref !== sidecar.sandboxId))
+    )
+      throw new RuntimeError(
+        "runtime_unavailable",
+        `Run ${runId} has a mismatched Railway sidecar; nothing was forgotten.`,
+      );
+    if (record === undefined) {
+      if (sidecar?.state !== "orphaned")
+        throw new RuntimeError(
+          "runtime_unavailable",
+          "Only an unknown or orphaned Railway run can be forgotten.",
+        );
+      const recoveredAt = (dependencies.now?.() ?? new Date()).toISOString();
+      const member = { swarm: name, account, profile: account };
+      record = {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        run: { runId, task: "Recovered orphaned Railway sandbox", mode: "agent" },
+        handle: {
           runId,
-          sandboxId,
-          projectId,
-          environmentId,
-          check,
-          state: forgotten.state,
-          forgottenAt,
-          confirmedBy: forgotten.confirmedBy,
-        };
-        if (json) io.stdout(JSON.stringify(result));
-        else
-          io.stdout(
-            `${runId}: forgotten after CLI confirmation at ${forgottenAt}. The run record is retained.`,
-          );
-        return 0;
-      },
-      { timeoutMs: 5_000, lockedMessage: busyMessage },
-    );
-  } catch (error) {
-    if (error instanceof FileLockedError) throw new RuntimeError("member_busy", busyMessage);
-    throw error;
-  }
+          kind: "railway",
+          member,
+          startedAt: recoveredAt,
+          ref: sidecar.sandboxId ?? "",
+        },
+        startedAt: recoveredAt,
+        state: "orphaned",
+        detail:
+          "Recovered from an orphaned Railway sidecar; original start time and scope were not recorded.",
+      };
+    }
+    if (record.kind !== "railway" || (record.state !== "unknown" && record.state !== "orphaned"))
+      throw new RuntimeError(
+        "runtime_unavailable",
+        "Only an unknown or orphaned Railway run can be forgotten.",
+      );
+    const sandboxId = record.handle.ref || sidecar?.sandboxId || null;
+    const projectId = record.handle.railwayScope?.projectId ?? null;
+    const environmentId = record.handle.railwayScope?.environmentId ?? null;
+    const shellWord = (value: string) =>
+      /^[A-Za-z0-9_.:-]+$/u.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+    const check = `railway sandbox list --project ${projectId === null ? "<original-project>" : shellWord(projectId)} --environment ${environmentId === null ? "<original-environment>" : shellWord(environmentId)}`;
+    const forgottenAt = (dependencies.now?.() ?? new Date()).toISOString();
+    io.stderr(`Sandbox: ${sandboxId ?? "not recorded"}`);
+    io.stderr(`Original Railway project: ${projectId ?? "not recorded"}`);
+    io.stderr(`Original Railway environment: ${environmentId ?? "not recorded"}`);
+    io.stderr(`Verify destruction in that scope with: ${check}`);
+    // Keep a blocking record before retiring an orphan-only sidecar. A failed
+    // final write leaves this record unresolved and eligible for a later retry.
+    if (recoveredOrphan) await writeRunRecord(home, record);
+    if (sidecar !== undefined) await rm(railwaySidecarPath(home, runId), { force: true });
+    const forgotten: RunRecord = {
+      ...record,
+      state: "forgotten",
+      forgottenAt,
+      confirmedBy: "cli",
+    };
+    await writeRunRecord(home, forgotten);
+    const result = {
+      swarm: name,
+      runId,
+      sandboxId,
+      projectId,
+      environmentId,
+      check,
+      state: forgotten.state,
+      forgottenAt,
+      confirmedBy: forgotten.confirmedBy,
+    };
+    if (json) io.stdout(JSON.stringify(result));
+    else
+      io.stdout(
+        `${runId}: forgotten after CLI confirmation at ${forgottenAt}. The run record is retained.`,
+      );
+    return 0;
+  });
 }
 
 type StopFailure = { runId: string; member: string; error: string };

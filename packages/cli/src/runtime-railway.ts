@@ -38,6 +38,7 @@ import {
   usdToAtomic,
   WalletStore,
   writeJsonAtomic,
+  withFileLock,
   type AgentProfile,
   type SecretStore,
   type SwarmBalanceReader,
@@ -55,6 +56,8 @@ import {
   type MemberBundleConfig,
 } from "@vapi-network/core/secrets";
 import {
+  readRunRecord,
+  withMemberRunLock,
   redactRunText,
   redactRunValue,
   registeredAgentProfileSchema,
@@ -1120,32 +1123,101 @@ export async function destroyRailwaySidecar(
   runId: string,
   options: { exec?: RailwayExec } = {},
 ): Promise<{ runId: string; sandboxId?: string; destroyed: boolean; error?: string }> {
-  const sidecar = await readSidecar(home, runId);
-  if (sidecar === undefined) {
-    return { runId, destroyed: false, error: `No readable railway sidecar for run ${runId}.` };
-  }
-  const id = sidecar.sandboxId;
-  if (id === undefined) {
-    const holder = sidecar.account === "" ? "a member" : sidecar.account;
-    return {
-      runId,
-      destroyed: false,
-      error: `Run ${runId} has no sandbox id, and a sandbox holding ${holder}'s private key may exist. Find it with railway sandbox list and run railway sandbox destroy <id>.`,
-    };
-  }
   try {
-    await destroySandbox(options.exec ?? defaultRailwayExec, id);
+    const observed = await readSidecar(home, runId);
+    const record = await readRunRecord(home, runId);
+    const account = sidecarAccount(observed, record);
+    const destroy = async () => {
+      const currentRecord = await readRunRecord(home, runId);
+      const sidecar = await readSidecar(home, runId);
+      if (sidecarAccount(sidecar, currentRecord) !== account) {
+        throw new RuntimeError(
+          "runtime_unavailable",
+          `Run ${runId} changed members while waiting for its lock. Retry cleanup.`,
+        );
+      }
+      if (currentRecord?.state === "forgotten") {
+        return sidecar === undefined
+          ? { runId, destroyed: true }
+          : {
+              runId,
+              destroyed: false,
+              error: `Run ${runId} was already forgotten but still has a sidecar. Inspect its current metadata; nothing was rewritten.`,
+            };
+      }
+      if (sidecar === undefined) {
+        return { runId, destroyed: false, error: `No readable railway sidecar for run ${runId}.` };
+      }
+      const id = sidecar.sandboxId;
+      if (id === undefined) {
+        const holder = sidecar.account === "" ? "a member" : sidecar.account;
+        return {
+          runId,
+          destroyed: false,
+          error: `Run ${runId} has no sandbox id, and a sandbox holding ${holder}'s private key may exist. Find it with railway sandbox list and run railway sandbox destroy <id>.`,
+        };
+      }
+      try {
+        await destroySandbox(options.exec ?? defaultRailwayExec, id);
+      } catch (error) {
+        // An unattributed legacy sidecar is already unresolved. Preserve its
+        // existing metadata rather than rewriting it without a member lock.
+        if (account !== undefined)
+          await writeSidecar(home, runId, { ...sidecar, state: "orphaned" }).catch(() => undefined);
+        return {
+          runId,
+          sandboxId: id,
+          destroyed: false,
+          error: `${scrub(errorMessage(error), [])}\nDestroy it yourself with: railway sandbox destroy ${id}`,
+        };
+      }
+      if (
+        account === undefined &&
+        sidecarAccount(await readSidecar(home, runId), await readRunRecord(home, runId)) !==
+          undefined
+      )
+        throw new RuntimeError(
+          "runtime_unavailable",
+          `Run ${runId} acquired member ownership during cleanup. Retry under its member lock.`,
+        );
+      await removeSidecar(home, runId);
+      return { runId, sandboxId: id, destroyed: true };
+    };
+    if (account !== undefined) return await withMemberRunLock(home, account, destroy);
+    // Legacy metadata can have no member at all. Forget cannot act on such a
+    // sidecar; serialize its cleanup by run id and reject any new ownership.
+    return await withFileLock(join(runsDirectory(home), `.sidecar-${runId}.lock`), destroy, {
+      timeoutMs: 5_000,
+      lockedMessage: `Run ${runId} is changing sidecar state.`,
+    });
   } catch (error) {
-    await writeSidecar(home, runId, { ...sidecar, state: "orphaned" }).catch(() => undefined);
     return {
       runId,
-      sandboxId: id,
       destroyed: false,
-      error: `${scrub(errorMessage(error), [])}\nDestroy it yourself with: railway sandbox destroy ${id}`,
+      error:
+        error instanceof RuntimeError
+          ? error.message
+          : `Could not reconcile the current Railway run/sidecar for ${runId}.`,
     };
   }
-  await removeSidecar(home, runId);
-  return { runId, sandboxId: id, destroyed: true };
+}
+
+function sidecarAccount(
+  sidecar: RailwaySidecar | undefined,
+  record: RunRecord | undefined,
+): string | undefined {
+  if (
+    record !== undefined &&
+    (record.kind !== "railway" ||
+      (sidecar?.account && sidecar.account !== record.member.account) ||
+      (sidecar?.swarm && record.member.swarm && sidecar.swarm !== record.member.swarm))
+  ) {
+    throw new RuntimeError(
+      "runtime_unavailable",
+      `Run ${record.runId} has mismatched Railway ownership metadata; nothing was changed.`,
+    );
+  }
+  return record?.member.account || sidecar?.account || undefined;
 }
 
 /** Destroys a sandbox; a clear sandbox-scoped not-found counts as destroyed. */

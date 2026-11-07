@@ -11,6 +11,9 @@ scoped packages. The packages share one version and are released together.
 
 ### Breaking (SDK)
 
+- `refreshRunRecord` now acquires the member lock, re-reads the stored record and returns its fresh state. Unknown and terminal records are never polled from stale snapshots. Missing records reject with `RuntimeError("run_not_found")`, changed member identity with `runtime_unavailable`, and lock contention with `member_busy`. MCP exports `withMemberRunLock(home, account, operation)` for the same lifecycle lock; no run-record schema or function argument changes in this round.
+- `destroyRailwaySidecar` serializes cleanup on the recorded member and re-reads ownership/state before acting. Concurrent completed confirmation with no sidecar returns `destroyed: true` without another Railway call; conflicting/current metadata or contention returns a failed cleanup result. Unattributed legacy cleanup is serialized by run id and does not rewrite failed metadata without a member lock.
+
 - Unknown Railway stops require destroy exit code zero; stderr warnings are accepted on success. Non-zero, interrupted and timeout outcomes reject even when text claims the sandbox was not found. Ordinary stop/status and `destroyRailwaySidecar` retain their base behavior.
 - MCP runtime `RunState` adds `orphaned` and `forgotten`; `RunRecord` and `DetachedRunSummary` add optional `forgottenAt` and `confirmedBy: "cli"`. A forgotten record requires both confirmation fields. `RuntimeHandle` adds optional `railwayScope: { projectId?, environmentId? }` for original creation metadata when available. MCP read-only run summaries include these states/confirmation fields; no forget tool is exposed.
 - `SwarmErrorCode` adds `swarm_workers_active` for active/unresolved-worker dissolution refusals. CLI JSON and MCP return that shared domain code instead of an untyped error.
@@ -18,6 +21,9 @@ scoped packages. The packages share one version and are released together.
 - MCP adds `swarm.stop` with `name` and exactly one of `runId` or `all: true`. `VapiServerOptions.runtimeForStop` optionally resolves stop-only adapters by runtime kind. The CLI-hosted server supplies local/Railway stop adapters without enabling remote startup or stale-start confirmation over MCP.
 
 ### Fixed
+
+- Concurrent Railway refreshes cannot turn a stored unknown run into finished through stale ordinary cleanup, or overwrite stopped/forgotten records and their confirmation metadata. Start and stop refresh through an internal helper while already holding the member lock.
+- Orphan-sidecar cleanup and CLI confirmation share the member lock. Failed cleanup cannot recreate a stale orphan after `forget-run` has retired it and retained the confirmation.
 
 - CLI `vapi swarm forget-run <swarm> <runId> --confirm-destroyed` lets an owner confirm a verified unknown/orphaned sandbox is destroyed. It prints the original recorded scope and check command, retains a timestamped `forgotten` run record and retires the matching sidecar. Missing scope is reported rather than guessed.
 - Unknown-run recovery never infers absence from human CLI text. Only a successful destroy or explicit CLI confirmation unblocks dissolution; failures move no funds. Railway experimental warnings no longer turn successful destroys into failures.

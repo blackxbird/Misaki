@@ -255,6 +255,28 @@ export async function refreshRunRecord(
   runtime?: Runtime,
   now: () => Date = () => new Date(),
 ): Promise<RunRecord> {
+  const candidate = await requireRunRecord(home, record.runId);
+  return await withMemberRunLock(
+    home,
+    candidate.member.account,
+    async () => await refreshRunRecordLocked(home, candidate, runtime, now),
+  );
+}
+
+/** The caller already holds this record's member lock (start, stop or refresh). */
+async function refreshRunRecordLocked(
+  home: string,
+  observed: RunRecord,
+  runtime?: Runtime,
+  now: () => Date = () => new Date(),
+): Promise<RunRecord> {
+  const record = await requireRunRecord(home, observed.runId);
+  if (record.member.account !== observed.member.account) {
+    throw new RuntimeError(
+      "runtime_unavailable",
+      `Run ${record.runId} changed members while waiting for its lock.`,
+    );
+  }
   if (
     (record.state !== "starting" && record.state !== "running") ||
     runtime?.kind !== record.kind
@@ -369,7 +391,7 @@ export async function startDetachedRun(args: {
       async () => {
         const records = await listRunRecords(args.home, { account: args.member.account });
         for (const record of records) {
-          const refreshed = await refreshRunRecord(args.home, record, args.runtime, args.now);
+          const refreshed = await refreshRunRecordLocked(args.home, record, args.runtime, args.now);
           if (refreshed.state === "starting" || refreshed.state === "running") {
             throw new RuntimeError(
               "member_busy",
@@ -554,7 +576,7 @@ export async function stopRun(args: {
             `Run ${stored.runId} changed members while waiting for its lock.`,
           );
         }
-        const current = await refreshRunRecord(args.home, stored, args.runtime, args.now);
+        const current = await refreshRunRecordLocked(args.home, stored, args.runtime, args.now);
         if (
           current.state !== "starting" &&
           current.state !== "running" &&
@@ -605,6 +627,32 @@ export async function stopRun(args: {
 
 function memberRunLockPath(home: string, account: string): string {
   return join(runsDirectory(home), `.member-${account}.lock`);
+}
+
+/** Serialize lifecycle observations and mutations for one member, across CLI and MCP. */
+export async function withMemberRunLock<T>(
+  home: string,
+  account: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!WALLET_NAME_PATTERN.test(account))
+    throw new RuntimeError("runtime_unavailable", `Invalid runtime member account: ${account}.`);
+  const busyMessage = `Member ${account} is changing run state.`;
+  try {
+    return await withFileLock(memberRunLockPath(home, account), operation, {
+      timeoutMs: 5_000,
+      lockedMessage: busyMessage,
+    });
+  } catch (error) {
+    if (error instanceof FileLockedError) throw new RuntimeError("member_busy", busyMessage);
+    throw error;
+  }
+}
+
+async function requireRunRecord(home: string, runId: string): Promise<RunRecord> {
+  const record = await readRunRecord(home, runId);
+  if (record === undefined) throw new RuntimeError("run_not_found", `Run ${runId} was not found.`);
+  return record;
 }
 
 export type DetachedRunSummary = {

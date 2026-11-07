@@ -129,10 +129,41 @@ describe("run registry", () => {
     await expect(readRunRecord(home, record.runId)).resolves.toEqual(refreshed);
 
     runtime.status = vi.fn().mockRejectedValue(new Error("status unavailable"));
+    await writeRunRecord(home, sampleRecord(runId(4)));
     await expect(refreshRunRecord(home, sampleRecord(runId(4)), runtime)).resolves.toEqual(
       sampleRecord(runId(4)),
     );
   });
+
+  it("does not recreate a deleted run from a stale refresh snapshot", async () => {
+    const home = await temporaryHome();
+    const runtime = new FakeRuntime();
+    const record = sampleRecord(runId(96));
+    runtime.statuses.set(record.runId, { state: "finished" });
+    await expect(refreshRunRecord(home, record, runtime)).rejects.toMatchObject({
+      code: "run_not_found",
+    });
+    expect(await readRunRecord(home, record.runId)).toBeUndefined();
+  });
+
+  it.each(["unknown", "stopped", "forgotten"] as const)(
+    "keeps a fresh %s state when a caller holds an old running snapshot",
+    async (state) => {
+      const home = await temporaryHome();
+      const runtime = new FakeRuntime();
+      const stale = sampleRecord(runId(95));
+      const current = {
+        ...stale,
+        state,
+        ...(state === "forgotten" ? { forgottenAt: ENDED_AT, confirmedBy: "cli" as const } : {}),
+      };
+      await writeRunRecord(home, current);
+      const status = vi.spyOn(runtime, "status").mockResolvedValue({ state: "finished" });
+      await expect(refreshRunRecord(home, stale, runtime)).resolves.toEqual(current);
+      expect(status).not.toHaveBeenCalled();
+      expect(await readRunRecord(home, stale.runId)).toEqual(current);
+    },
+  );
 
   it("refuses a running member and allows terminal member records", async () => {
     const busyHome = await temporaryHome();

@@ -68,6 +68,7 @@ export {
   stopRun,
   summarizeRunRecord,
   writeRunRecord,
+  withMemberRunLock,
   type DetachedRunSummary,
   type DetachedSwarmRunResult,
   type RunRecord,

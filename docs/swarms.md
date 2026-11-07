@@ -206,6 +206,8 @@ vapi swarm forget-run research <runId> --confirm-destroyed
 
 The retained run record becomes `forgotten` with `forgottenAt` and `confirmedBy: "cli"`; it no longer blocks dissolution. A matching sidecar is retired. An orphan-only sidecar first receives a blocking run record, so a failed final write remains unresolved and can be retried. No MCP forget tool or confirmation flag is exposed: agents can attempt a normal stop but cannot confirm away their money guard. The dissolution refusal names `vapi swarm stop` for live workers and the CLI confirmation command for unknown/orphaned ones.
 
+Polls, stops, CLI confirmation and cleanup of an identified member share its lifecycle lock. A poll re-reads the run inside that lock before contacting Railway: an older `running` snapshot cannot move a stored `unknown` run to finished or overwrite stopped/forgotten state and confirmation. Start and stop use an internal refresh while already holding the lock. Cleanup re-reads the sidecar under that same lock, so a failed destroy cannot recreate an orphan after confirmation removed it. Lock contention leaves metadata unchanged and reports a busy member.
+
 `--keep-sandbox` keeps a finished run's sandbox for inspection, with the member key still inside it. `vapi swarm runs` leaves a kept sandbox up and lists it as `kept`. `vapi swarm stop <name> --all`, or `vapi swarm stop <name> <runId>`, destroys it. Without that, it stays up until the idle timeout (30 minutes).
 
 ### Orphaned sandboxes
