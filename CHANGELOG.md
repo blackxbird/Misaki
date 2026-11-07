@@ -9,6 +9,11 @@ scoped packages. The packages share one version and are released together.
   deduplication in core, break the HD/keystore and Solana/x402 runtime import cycles,
   and refresh the deprecated wallet option's removal notice without changing behavior.
 
+### Fixed
+
+- Swarm dissolution performs one shared core check before any balance lookup, pending movement resumption or transfer. CLI and MCP refresh tracked runs before that check and refuse active or unresolved Railway runs and sidecars with the same stop guidance. The core check also fails closed without a runtime adapter.
+- `SwarmCapitalDeps` adds an optional `reconcileRuns` port; local run records remain the authority for the final eligibility check. Existing lock and journal formats are unchanged.
+
 ## 0.12.0 — 2026-10-30
 
 ### Added

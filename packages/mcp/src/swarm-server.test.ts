@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   BASE_MAINNET_CAIP2,
   WalletStore,
+  writeJsonAtomic,
   createAccount,
   getDefaultConfig,
   readSwarm,
@@ -24,7 +25,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { listRunRecords, type Runtime, type RuntimeStatus } from "./agent/runtime.js";
+import {
+  listRunRecords,
+  writeRunRecord,
+  type Runtime,
+  type RuntimeStatus,
+} from "./agent/runtime.js";
 
 const mocks = vi.hoisted(() => ({
   callService: vi.fn(),
@@ -65,6 +71,122 @@ afterEach(async () => {
 });
 
 describe("MCP swarm lifecycle", () => {
+  it.each(["starting", "running", "unknown"] as const)(
+    "refuses dissolution with a tracked %s Railway run before moving money",
+    async (state) => {
+      const transfer = vi.fn<MovementTransfer>(async (args) => ({
+        status: "sent",
+        from: args.from,
+        to: OWNER,
+        toName: args.to,
+        toKind: "account",
+        amountUsd: String(args.amountUsd),
+        amountAtomic: usdToAtomic(args.amountUsd).toString(),
+        network: BASE_MAINNET_CAIP2,
+        txHash: `0x${"34".repeat(32)}`,
+        nonce: (args.nonce ?? args.resume)!,
+        replayed: false,
+      }));
+      const balanceReader = vi.fn(async () => 1_000_000n);
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        swarm: { transfer, balanceReader },
+      });
+      const runId = "run_0123456789abcdef01234567";
+      const member = { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" };
+      await writeRunRecord(fixture.home, {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        run: { runId, task: "Work", mode: "agent" },
+        handle: {
+          runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_1",
+        },
+        startedAt: new Date(NOW).toISOString(),
+        state,
+      });
+
+      const result = await fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
+      expect(result.content[0]?.text).toContain("sbx_1");
+      expect(transfer).not.toHaveBeenCalled();
+      expect(balanceReader).not.toHaveBeenCalled();
+      expect(await movementFiles(fixture.home)).toEqual([]);
+      await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+      await fixture.server.close();
+    },
+  );
+
+  it.each([
+    { state: "finished" as const, sidecar: false, refused: false },
+    { state: "finished" as const, sidecar: true, refused: true },
+    { state: "unknown" as const, sidecar: false, refused: true },
+  ])(
+    "reconciles a Railway run to $state with sidecar=$sidecar before dissolution",
+    async ({ state, sidecar, refused }) => {
+      const status = vi.fn<Runtime["status"]>(async () => ({ state }));
+      const runtime: Runtime = { kind: "railway", start: vi.fn(), stop: vi.fn(), status };
+      const transfer = vi.fn<MovementTransfer>();
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        runtime,
+        swarm: { transfer, balanceReader: async () => 0n },
+      });
+      const runId = "run_0123456789abcdef01234567";
+      const member = { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" };
+      await writeRunRecord(fixture.home, {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        state: "running",
+        run: { runId, task: "Work", mode: "agent" },
+        handle: {
+          runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_1",
+        },
+        startedAt: new Date(NOW).toISOString(),
+      });
+      if (sidecar)
+        await writeJsonAtomic(join(fixture.home, "runs", `${runId}.railway.json`), {
+          v: 1,
+          swarm: "team",
+          sandboxId: "sbx_1",
+        });
+
+      const result = await fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+
+      expect(status).toHaveBeenCalledOnce();
+      expect((await listRunRecords(fixture.home))[0]?.state).toBe(state);
+      if (refused) {
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
+        await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+      } else {
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(result.structuredContent).toMatchObject({ status: "dissolved" });
+      }
+      expect(transfer).not.toHaveBeenCalled();
+      await fixture.server.close();
+    },
+  );
+
   it("runs swarm.setup with fundUsd twice but creates one funding movement", async () => {
     let movementId = 0;
     let nonce = 0;

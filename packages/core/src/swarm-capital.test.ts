@@ -1368,6 +1368,103 @@ describe("leaving a swarm", () => {
 });
 
 describe("dissolving a swarm", () => {
+  it.each([
+    {
+      label: "orphaned sidecar",
+      suffix: ".railway.json",
+      contents: {
+        v: 1,
+        swarm: "team",
+        account: "team-lead-1",
+        state: "orphaned",
+        sandboxId: "sbx_1",
+      },
+    },
+    {
+      label: "kept sidecar",
+      suffix: ".railway.json",
+      contents: { v: 1, swarm: "team", account: "team-lead-1", state: "kept", sandboxId: "sbx_1" },
+    },
+    {
+      label: "unattributed legacy sidecar",
+      suffix: ".railway.json",
+      contents: { v: 1, checkpoint: "test", keepSandbox: true, sandboxId: "sbx_1" },
+    },
+    { label: "unreadable run record", suffix: ".json", contents: null },
+  ])("refuses a tracked $label before moving money", async ({ suffix, contents }) => {
+    const fixture = await capitalFixture();
+    fixture.balances.set("team-lead-1", 1_000_000n);
+    const runs = join(fixture.home, "runs");
+    await mkdir(runs, { recursive: true });
+    await writeFile(join(runs, `run_0123456789abcdef01234567${suffix}`), JSON.stringify(contents));
+    const reconcileCeilingSweep = vi.fn<NonNullable<SwarmCapitalDeps["reconcileCeilingSweep"]>>();
+    fixture.deps.reconcileCeilingSweep = reconcileCeilingSweep;
+
+    await expect(dissolveSwarm({ name: "team" }, fixture.deps)).rejects.toThrow(
+      "vapi swarm stop team --all",
+    );
+
+    expect(reconcileCeilingSweep).not.toHaveBeenCalled();
+    expect(fixture.transfer).not.toHaveBeenCalled();
+    expect(await movementFiles(fixture.home)).toEqual([]);
+    await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+  });
+
+  it("reconciles worker state before checking dissolution eligibility", async () => {
+    const fixture = await capitalFixture();
+    const path = join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json");
+    await mkdir(join(fixture.home, "runs"), { recursive: true });
+    await writeFile(path, JSON.stringify({ v: 1, swarm: "team", sandboxId: "sbx_1" }));
+    const reconcileRuns = vi.fn(async () => {
+      await rm(path);
+    });
+    fixture.deps.reconcileRuns = reconcileRuns;
+
+    await expect(dissolveSwarm({ name: "team" }, fixture.deps)).resolves.toMatchObject({
+      status: "dissolved",
+    });
+
+    expect(reconcileRuns).toHaveBeenCalledWith({ home: fixture.home, name: "team" });
+  });
+
+  it.each([
+    { kind: "local", swarm: "team", account: "team-lead-1", state: "running" },
+    { kind: "railway", swarm: "other", account: "other-lead-1", state: "running" },
+    { kind: "railway", swarm: "team", account: "team-lead-1", state: "stopped" },
+  ])(
+    "allows dissolution with a $kind $state run of $swarm that holds no remote swarm key",
+    async (record) => {
+      const fixture = await capitalFixture();
+      const runId = "run_0123456789abcdef01234567";
+      await mkdir(join(fixture.home, "runs"), { recursive: true });
+      await writeFile(
+        join(fixture.home, "runs", `${runId}.json`),
+        JSON.stringify({
+          v: 1,
+          runId,
+          kind: record.kind,
+          state: record.state,
+          member: { swarm: record.swarm, account: record.account },
+          handle: { ref: "sbx_1" },
+        }),
+      );
+      // Other swarms' sidecars must not block this swarm either.
+      await writeFile(
+        join(fixture.home, "runs", "run_1123456789abcdef01234567.railway.json"),
+        JSON.stringify({
+          v: 1,
+          swarm: "other",
+          account: "other-lead-1",
+          sandboxId: "sbx_other",
+        }),
+      );
+
+      await expect(dissolveSwarm({ name: "team" }, fixture.deps)).resolves.toMatchObject({
+        status: "dissolved",
+      });
+    },
+  );
+
   it("resumes a qualifying movement and stops before dissolving the swarm", async () => {
     const fixture = await capitalFixture();
     const movementId = "mv_dissolve_resume";
