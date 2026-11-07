@@ -191,7 +191,7 @@ vapi swarm stop research --all
 
 The CLI waits up to about 30 seconds for a new sandbox to answer before it starts the member. The task reaches the sandbox base64url-encoded, so quotes and shell characters arrive unchanged.
 
-`vapi swarm runs` reads each sandbox's result. It also reconciles a `starting` record from its saved local process id or Railway sidecar. A finished run's sandbox is destroyed on that call, so a member key does not sit in an idle sandbox. If that destroy fails, the run stays `running` with a sanitized detail. Human output prints a warning and JSON includes `detail`. The command exits with code 1 until cleanup succeeds. `vapi swarm stop` stops both recovered starts and running workers.
+`vapi swarm runs` reads each sandbox's result. It also reconciles a `starting` record from its saved local process id or Railway sidecar. A finished run's sandbox is destroyed on that call, so a member key does not sit in an idle sandbox. If that destroy fails, the run stays `running` with a sanitized detail. Human output prints a warning and JSON includes `detail`. The command exits with code 1 until cleanup succeeds. `vapi swarm stop` stops recovered starts, running workers and unknown runs. Unknown runs remain blocked until the stop adapter confirms destruction or absence; a failed stop leaves the record unresolved.
 
 A sandbox counts as gone only when `railway` says the sandbox was not found (`sandbox not found`, or `sandbox <id> not found` for this id), or answers 404 naming this sandbox id and nothing else. A not-found for a project, environment, token, workspace or another sandbox is not "gone". Any other destroy or exec failure is an error: `vapi swarm stop` keeps the run `running`, prints the error and exits with code 1.
 

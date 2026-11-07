@@ -2186,6 +2186,91 @@ describe("vapi swarm railway runs", () => {
     expect(await readdir(join(home, "runs"))).toEqual([`${OTHER_RUN}.railway.json`]);
   });
 
+  it.each(["destroyed", "gone", "error"] as const)(
+    "recovers an unknown Railway run through stop --all (%s)",
+    async (outcome) => {
+      const home = await homeWithStoredSwarm("vapi-swarm-unknown-stop-");
+      const member = { swarm: "team", account: "team-lead-1", profile: "team-lead-1" };
+      const handle = {
+        runId: ORPHAN_RUN,
+        kind: "railway" as const,
+        member,
+        ref: "sbx_9",
+        startedAt: "2026-09-30T08:00:00.000Z",
+      };
+      await writeRunRecord(home, {
+        v: 1,
+        runId: ORPHAN_RUN,
+        kind: "railway",
+        member,
+        handle,
+        run: { runId: ORPHAN_RUN, task: "Work", mode: "agent" },
+        state: "running",
+        startedAt: handle.startedAt,
+      });
+      await writeSidecarFile(home, {
+        runId: ORPHAN_RUN,
+        account: member.account,
+        state: "running",
+        sandboxId: handle.ref,
+      });
+      const destroys: string[] = [];
+      const exec = vi.fn<RailwayExec>(async (_file, args) => {
+        if (args[1] === "exec")
+          return { code: 1, stdout: "", stderr: "Error: Sandbox sbx_9 not found" };
+        if (args[1] === "destroy") {
+          destroys.push(args[2]!);
+          return outcome === "destroyed"
+            ? { code: 0, stdout: "", stderr: "" }
+            : {
+                code: 1,
+                stdout: "",
+                stderr: outcome === "gone" ? "Error: Sandbox sbx_9 not found" : "request timed out",
+              };
+        }
+        throw new Error(`Unexpected Railway command: ${args.join(" ")}`);
+      });
+      const transfer = vi.fn<MovementTransfer>();
+      const balanceReader = vi.fn(async () => (outcome === "error" ? 1_000_000n : 0n));
+      const deps = {
+        ...railwayDependencies(exec),
+        swarm: { balanceReader, transfer },
+      };
+      expect(await run(["swarm", "runs", "team", "--json"], captureIo().io, deps)).toBe(0);
+      expect((await listRunRecords(home))[0]?.state).toBe("unknown");
+      expect(
+        (await readdir(join(home, "runs"))).filter((file) => file.endsWith(".railway.json")),
+      ).toEqual([]);
+      const blocked = captureIo();
+      expect(await run(["swarm", "dissolve", "team", "--json"], blocked.io, deps)).toBe(1);
+      expect(onlyLine(blocked.stdout)).toContain("vapi swarm stop team --all");
+
+      const stopped = captureIo();
+      expect(await run(["swarm", "stop", "team", "--all", "--json"], stopped.io, deps)).toBe(
+        outcome === "error" ? 1 : 0,
+      );
+      expect(destroys).toEqual(["sbx_9"]);
+      expect((await listRunRecords(home))[0]?.state).toBe(
+        outcome === "error" ? "unknown" : "stopped",
+      );
+      const dissolved = captureIo();
+      expect(await run(["swarm", "dissolve", "team", "--json"], dissolved.io, deps)).toBe(
+        outcome === "error" ? 1 : 0,
+      );
+      expect(JSON.parse(onlyLine(dissolved.stdout))).toMatchObject(
+        outcome === "error" ? { code: "swarm_workers_active" } : { status: "dissolved" },
+      );
+      if (outcome === "error") {
+        expect(balanceReader).not.toHaveBeenCalled();
+        expect(JSON.parse(onlyLine(stopped.stdout))).toMatchObject({
+          failed: [{ runId: ORPHAN_RUN }],
+        });
+        await expect(readSwarm(home, "team")).resolves.toBeDefined();
+      }
+      expect(transfer).not.toHaveBeenCalled();
+    },
+  );
+
   it("refuses to dissolve while a railway sandbox of the swarm is tracked", async () => {
     const home = await homeWithRailwaySwarm("vapi-swarm-railway-dissolve-sidecar-");
     await writeSidecarFile(home, { runId: ORPHAN_RUN, sandboxId: "sbx_9" });
@@ -2196,7 +2281,8 @@ describe("vapi swarm railway runs", () => {
 
     const captured = captureIo();
     expect(await run(["swarm", "dissolve", "team", "--json"], captured.io, deps)).toBe(1);
-    const error = JSON.parse(onlyLine(captured.stdout)) as { error: string };
+    const error = JSON.parse(onlyLine(captured.stdout)) as { error: string; code: string };
+    expect(error.code).toBe("swarm_workers_active");
     expect(error.error).toContain("sbx_9");
     expect(error.error).toContain("vapi swarm stop team --all");
     // The swarm is kept, so runs and stop still reach the sandbox.

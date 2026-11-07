@@ -402,7 +402,37 @@ describe("run registry", () => {
     expect(redacted).not.toContain(PHRASE);
   });
 
-  it("stops only the registry handle and never stops a non-running record", async () => {
+  it.each([
+    { state: "running" as const, fails: false },
+    { state: "unknown" as const, fails: false },
+    { state: "running" as const, fails: true },
+    { state: "unknown" as const, fails: true },
+  ])(
+    "stops an unknown worker only after adapter confirmation ($state, fails=$fails)",
+    async ({ state, fails }) => {
+      const home = await temporaryHome();
+      const runtime = new FakeRuntime();
+      const record = { ...sampleRecord(runId(59)), state };
+      await writeRunRecord(home, record);
+      runtime.statuses.set(record.runId, { state: "unknown", detail: "sandbox gone" });
+      const stop = vi.spyOn(runtime, "stop").mockImplementation(async () => {
+        expect((await readRunRecord(home, record.runId))?.state).toBe("unknown");
+        if (fails) throw new Error("stop failed");
+      });
+      const operation = stopRun({ home, runtime, record, now: () => new Date(ENDED_AT) });
+      if (fails) {
+        await expect(operation).rejects.toThrow("stop failed");
+        expect((await readRunRecord(home, record.runId))?.state).toBe("unknown");
+      } else {
+        await expect(operation).resolves.toMatchObject({ state: "stopped", endedAt: ENDED_AT });
+        expect((await readRunRecord(home, record.runId))?.state).toBe("stopped");
+      }
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop).toHaveBeenCalledWith(record.handle);
+    },
+  );
+
+  it("stops only the registry handle and never stops a terminal record", async () => {
     const home = await temporaryHome();
     const runtime = new FakeRuntime();
     const stored = sampleRecord(runId(40));

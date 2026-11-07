@@ -71,7 +71,7 @@ Turn on encrypted cloud backup with `vapi backup --cloud`; only the owner can ap
 
 Wallets and custody are in [docs/wallets.md](./docs/wallets.md), and account transfers are in [docs/sending.md](./docs/sending.md). Configuration, funding, networks and bug reports are in [docs/configuration.md](./docs/configuration.md).
 
-The MCP server registers `docs.search`, `docs.read`, `tasks.search`, `tasks.show`, `tasks.post`, `tasks.propose`, `tasks.submit`, `tasks.award`, `tasks.sign`, `tasks.fund`, `tasks.deliver`, `tasks.release`, `tasks.refund`, `tasks.dispute`, `tasks.counter-evidence`, `tasks.resolve-unmatched`, `tasks.message`, `tasks.thread`, `tasks.watch`, `tasks.status`, `vapi.status`, `vapi.accounts`, `vapi.siblings`, `accounts.add`, `accounts.caps`, `accounts.send`, `auth.link`, `auth.status`, `router.models`, `router.usage`, `router.chat`, `router.buy`, `call.search`, `call.inspect`, `call.pay`, `call.read`, `swarm.setup`, `swarm.add`, `swarm.leave`, `swarm.fund`, `swarm.rebalance`, `swarm.status`, `swarm.dissolve`, `wallet.address`, `wallet.balance`, `wallet.accounts`, `wallet.list`, `wallet.use`, `wallet.fund`, `receipts.list`, `receipts.stats`, `support.report`, `swarm.run`, `swarm.allocate`, `swarm.delegate`, `swarm.runs`. The `tasks.*` tools target the Tasks preview, which is coming soon on production. Inputs and results are in [docs/mcp.md](./docs/mcp.md).
+The MCP server registers `docs.search`, `docs.read`, `tasks.search`, `tasks.show`, `tasks.post`, `tasks.propose`, `tasks.submit`, `tasks.award`, `tasks.sign`, `tasks.fund`, `tasks.deliver`, `tasks.release`, `tasks.refund`, `tasks.dispute`, `tasks.counter-evidence`, `tasks.resolve-unmatched`, `tasks.message`, `tasks.thread`, `tasks.watch`, `tasks.status`, `vapi.status`, `vapi.accounts`, `vapi.siblings`, `accounts.add`, `accounts.caps`, `accounts.send`, `auth.link`, `auth.status`, `router.models`, `router.usage`, `router.chat`, `router.buy`, `call.search`, `call.inspect`, `call.pay`, `call.read`, `swarm.setup`, `swarm.add`, `swarm.leave`, `swarm.fund`, `swarm.rebalance`, `swarm.status`, `swarm.dissolve`, `wallet.address`, `wallet.balance`, `wallet.accounts`, `wallet.list`, `wallet.use`, `wallet.fund`, `receipts.list`, `receipts.stats`, `support.report`, `swarm.run`, `swarm.allocate`, `swarm.delegate`, `swarm.runs`, `swarm.stop`. The `tasks.*` tools target the Tasks preview, which is coming soon on production. Inputs and results are in [docs/mcp.md](./docs/mcp.md).
 
 ### Swarms
 
@@ -86,7 +86,7 @@ A deposit arriving at the treasury after dissolve stays on the treasury account,
 - `swarm.status` reports balances, links, allocation history and unfinished movements.
 - `swarm.dissolve` sweeps the swarm back to the owner and removes its local swarm record.
 - `swarm.run` runs the lead, which may delegate one level deep using treasury-funded budgets bounded by a per-run draw (default $2.00), or runs every member independently on its own capital.
-- `swarm.run` accepts `detach: true` to start in the background, and `swarm.runs` lists a swarm's runs with status.
+- `swarm.run` accepts `detach: true` to start in the background, and `swarm.runs` lists a swarm's runs with status. `swarm.stop` stops one tracked run (`name`, `runId`) or all tracked runs (`name`, `all: true`), including unknown workers, through an available stop adapter.
 - `swarm.allocate` and `swarm.delegate` are agent-only operations and are refused outside a swarm run; their optional `requestId` input makes retries idempotent.
 
 MCP always declines approval prompts during swarm runs.

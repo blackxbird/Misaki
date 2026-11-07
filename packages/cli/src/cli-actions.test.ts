@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SecretStore } from "@vapi-network/core";
-import type { Action, ActionContext, Runtime } from "@vapi-network/mcp";
+import type { Action, ActionContext, Runtime, VapiServerOptions } from "@vapi-network/mcp";
 
 const runActionCalls = vi.hoisted(() => [] as string[]);
 const runActionInputs = vi.hoisted(() => [] as unknown[]);
@@ -204,14 +204,22 @@ describe("CLI action register", () => {
       stop: async () => undefined,
       status: async () => ({ state: "unknown" }),
     };
-    const resolveRuntime = vi.fn(() => runtime);
+    const railway: Runtime = { ...runtime, kind: "railway" };
+    const resolveRuntime = vi.fn((kind: Runtime["kind"]) =>
+      kind === "railway" ? railway : runtime,
+    );
 
     expect(
       await runCli(["mcp"], captureIo().io, { ...dependencies, runtime: resolveRuntime }),
     ).toBe(0);
 
     expect(resolveRuntime).toHaveBeenCalledWith("local", process.env.VAPI_HOME);
-    expect(startStdioServer).toHaveBeenCalledWith(expect.objectContaining({ runtime }));
+    expect(startStdioServer).toHaveBeenCalledWith(
+      expect.objectContaining({ runtime, runtimeForStop: expect.any(Function) }),
+    );
+    const [options] = startStdioServer.mock.calls[0] as unknown as [VapiServerOptions];
+    expect(options.runtimeForStop?.("railway")).toBe(railway);
+    expect(resolveRuntime).toHaveBeenCalledWith("railway", process.env.VAPI_HOME);
   });
 });
 

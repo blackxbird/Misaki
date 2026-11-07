@@ -1400,9 +1400,11 @@ describe("dissolving a swarm", () => {
     const reconcileCeilingSweep = vi.fn<NonNullable<SwarmCapitalDeps["reconcileCeilingSweep"]>>();
     fixture.deps.reconcileCeilingSweep = reconcileCeilingSweep;
 
-    await expect(dissolveSwarm({ name: "team" }, fixture.deps)).rejects.toThrow(
-      "vapi swarm stop team --all",
-    );
+    await expect(dissolveSwarm({ name: "team" }, fixture.deps)).rejects.toMatchObject({
+      name: "SwarmError",
+      code: "swarm_workers_active",
+      message: expect.stringContaining("vapi swarm stop team --all"),
+    });
 
     expect(reconcileCeilingSweep).not.toHaveBeenCalled();
     expect(fixture.transfer).not.toHaveBeenCalled();

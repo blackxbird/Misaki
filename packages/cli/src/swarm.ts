@@ -763,7 +763,7 @@ async function stopCommand(
   const unchanged: DetachedRunSummary[] = [];
   const failed: StopFailure[] = [];
   for (const record of targets) {
-    if (record.state !== "starting" && record.state !== "running") {
+    if (record.state !== "starting" && record.state !== "running" && record.state !== "unknown") {
       unchanged.push(summarizeRunRecord(record));
       continue;
     }
@@ -778,7 +778,7 @@ async function stopCommand(
         ...(confirmWorkerStopped ? { confirmWorkerStopped: true } : {}),
       });
     } catch (error) {
-      // The record stays running; the other runs are still stopped.
+      // A failed stop stays unresolved; the other runs are still stopped.
       failed.push({
         runId: record.runId,
         member: record.member.account,

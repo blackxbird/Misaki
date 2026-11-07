@@ -102,6 +102,10 @@ export const TOOL_PRESENTATION: Readonly<Record<string, ToolPresentation>> = {
   "swarm.allocate": { title: "Allocate swarm budget", annotations: destructive },
   "swarm.delegate": { title: "Delegate a swarm task", annotations: destructive },
   "swarm.runs": { title: "List swarm runs", annotations: readOnly },
+  "swarm.stop": {
+    title: "Stop swarm workers",
+    annotations: destructive,
+  },
 };
 
 export function withPresentation<T extends { name: string }>(tool: T): T & ToolPresentation {

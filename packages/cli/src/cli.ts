@@ -61,6 +61,7 @@ import {
   swarmParentResolver,
   sweepAboveCeiling,
   SweepGasError,
+  SwarmError,
   TransferError,
   sweepBack,
   unlockProtectedVault,
@@ -1000,7 +1001,10 @@ export async function runCli(
           JSON.stringify({
             error: message,
             exitCode: code,
-            ...(error instanceof RuntimeError ? { code: error.code } : {}),
+            ...(error instanceof RuntimeError ||
+            (error instanceof SwarmError && error.code === "swarm_workers_active")
+              ? { code: error.code }
+              : {}),
             ...(error instanceof VapiCallError ? { code: error.code } : {}),
             ...(error instanceof DocsError ? { code: error.code } : {}),
             ...(error instanceof RemoteKeyRefusedError ? { code: error.code } : {}),
@@ -3705,6 +3709,7 @@ async function mcpCommand(argv: string[], dependencies: CliDependencies): Promis
     receiptsPath: paths.receipts,
     searchesPath: paths.searches,
     runtime: resolveRuntime("local", paths.directory, dependencies),
+    runtimeForStop: (kind) => resolveRuntime(kind, paths.directory, dependencies),
   });
 }
 

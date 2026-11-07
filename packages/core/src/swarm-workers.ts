@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { z } from "zod";
 
 import { isMissingFile } from "./config.js";
-import { swarmAccountNames, type SwarmFile } from "./swarm.js";
+import { swarmAccountNames, SwarmError, type SwarmFile } from "./swarm.js";
 
 // Read only worker ownership and lifecycle metadata. Runtime adapters own the
 // full records and may reconcile them before this final, fail-closed check.
@@ -81,10 +81,12 @@ export async function assertSwarmWorkersStopped(home: string, swarm: SwarmFile):
     );
   }
   if (blockers.length > 0) {
-    throw new Error(
+    throw new SwarmError(
+      "swarm_workers_active",
       [
         `Swarm ${swarm.name} still has Railway sandboxes or unresolved workers that may hold a member key: ${blockers.join(", ")}.`,
         `Stop them first with: vapi swarm stop ${swarm.name} --all`,
+        `For tracked runs, use MCP swarm.stop with { "name": "${swarm.name}", "all": true } when its runtime is available.`,
         "Then dissolve again. Nothing was moved.",
       ].join("\n"),
     );

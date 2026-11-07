@@ -525,7 +525,12 @@ export async function stopRun(args: {
           );
         }
         const current = await refreshRunRecord(args.home, stored, args.runtime, args.now);
-        if (current.state !== "starting" && current.state !== "running") return current;
+        if (
+          current.state !== "starting" &&
+          current.state !== "running" &&
+          current.state !== "unknown"
+        )
+          return current;
         if (args.runtime.kind !== current.kind) {
           throw new RuntimeError(
             "runtime_unavailable",

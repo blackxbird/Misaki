@@ -136,7 +136,8 @@ export type SwarmErrorCode =
   | "movement_unfinished"
   | "ceiling_sweep_pending"
   | "account_address_mismatch"
-  | "swarm_locked";
+  | "swarm_locked"
+  | "swarm_workers_active";
 export class SwarmError extends Error {
   constructor(
     readonly code: SwarmErrorCode,

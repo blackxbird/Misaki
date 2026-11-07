@@ -71,6 +71,157 @@ afterEach(async () => {
 });
 
 describe("MCP swarm lifecycle", () => {
+  it.each(["foreign", "unavailable"] as const)(
+    "refuses MCP stop for a %s run without clearing it",
+    async (reason) => {
+      const stop = vi.fn<Runtime["stop"]>();
+      const runtime: Runtime = {
+        kind: "local",
+        start: vi.fn(),
+        stop,
+        status: async () => ({ state: "unknown" }),
+      };
+      const fixture = await runnableSwarmFixture({ replies: [], runtime });
+      try {
+        const runId = "run_0123456789abcdef01234567";
+        const member = {
+          swarm: reason === "foreign" ? "other" : "team",
+          account: fixture.swarm.members[0]!.account,
+          profile: "lead",
+        };
+        await writeRunRecord(fixture.home, {
+          v: 1,
+          runId,
+          kind: "railway",
+          member,
+          handle: {
+            runId,
+            kind: "railway",
+            member,
+            ref: "sbx_still_unknown",
+            startedAt: new Date(NOW).toISOString(),
+          },
+          run: { runId, task: "Work", mode: "agent" },
+          state: "unknown",
+          startedAt: new Date(NOW).toISOString(),
+        });
+        const result = await fixture.server.callTool({
+          name: "swarm.stop",
+          arguments: { name: "team", runId },
+        });
+        expect(result.isError).toBe(true);
+        const payload = JSON.parse(result.content[0]!.text);
+        expect(reason === "foreign" ? payload.code : payload.failed[0].code).toBe(
+          reason === "foreign" ? "run_not_found" : "runtime_unavailable",
+        );
+        expect(stop).not.toHaveBeenCalled();
+        expect((await listRunRecords(fixture.home))[0]?.state).toBe("unknown");
+      } finally {
+        await fixture.server.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "stops a gone sandbox's unknown run through MCP (stop fails=%s)",
+    async (fails) => {
+      let home = "";
+      const runId = "run_0123456789abcdef01234567";
+      const stop = vi.fn<Runtime["stop"]>(async () => {
+        expect((await listRunRecords(home))[0]?.state).toBe("unknown");
+        if (fails) throw new Error("sandbox destruction timed out");
+      });
+      const runtime: Runtime = {
+        kind: "railway",
+        start: vi.fn(),
+        stop,
+        status: async () => {
+          await rm(join(home, "runs", `${runId}.railway.json`), { force: true });
+          return { state: "unknown", detail: "sandbox gone" };
+        },
+      };
+      const runtimeForStop = vi.fn(() => runtime);
+      const transfer = vi.fn<MovementTransfer>();
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        runtime,
+        runtimeForStop,
+        swarm: { transfer, balanceReader: async () => 0n },
+      });
+      home = fixture.home;
+      try {
+        const member = {
+          swarm: "team",
+          account: fixture.swarm.members[0]!.account,
+          profile: "lead",
+        };
+        const handle = {
+          runId,
+          kind: "railway" as const,
+          member,
+          ref: "sbx_gone",
+          startedAt: new Date(NOW).toISOString(),
+        };
+        await writeRunRecord(home, {
+          v: 1,
+          runId,
+          kind: "railway",
+          member,
+          handle,
+          run: { runId, task: "Work", mode: "agent" },
+          state: "running",
+          startedAt: handle.startedAt,
+        });
+        await writeJsonAtomic(join(home, "runs", `${runId}.railway.json`), {
+          v: 1,
+          swarm: "team",
+          account: member.account,
+          sandboxId: handle.ref,
+        });
+        const listed = await fixture.server.callTool({
+          name: "swarm.runs",
+          arguments: { name: "team" },
+        });
+        expect(listed.structuredContent).toMatchObject({ runs: [{ state: "unknown" }] });
+        expect(
+          (await readdir(join(home, "runs"))).filter((file) => file.endsWith(".railway.json")),
+        ).toEqual([]);
+        expect(
+          (await fixture.server.callTool({ name: "swarm.dissolve", arguments: { name: "team" } }))
+            .isError,
+        ).toBe(true);
+
+        const stopped = await fixture.server.callTool({
+          name: "swarm.stop",
+          arguments: { name: "team", all: true },
+        });
+        expect(Boolean(stopped.isError)).toBe(fails);
+        expect(runtimeForStop).toHaveBeenCalledWith("railway");
+        expect(stop).toHaveBeenCalledOnce();
+        expect(stop).toHaveBeenCalledWith(handle);
+        expect((await listRunRecords(home))[0]?.state).toBe(fails ? "unknown" : "stopped");
+        const dissolved = await fixture.server.callTool({
+          name: "swarm.dissolve",
+          arguments: { name: "team" },
+        });
+        if (fails) {
+          expect(dissolved.isError).toBe(true);
+          expect(JSON.parse(dissolved.content[0]!.text)).toMatchObject({
+            code: "swarm_workers_active",
+          });
+          expect(dissolved.content[0]!.text).toContain("swarm.stop");
+          await expect(readSwarm(home, "team")).resolves.toBeDefined();
+        } else {
+          expect(dissolved.isError, JSON.stringify(dissolved)).not.toBe(true);
+          expect(dissolved.structuredContent).toMatchObject({ status: "dissolved" });
+        }
+        expect(transfer).not.toHaveBeenCalled();
+      } finally {
+        await fixture.server.close();
+      }
+    },
+  );
+
   it.each(["starting", "running", "unknown"] as const)(
     "refuses dissolution with a tracked %s Railway run before moving money",
     async (state) => {
@@ -117,6 +268,7 @@ describe("MCP swarm lifecycle", () => {
       });
 
       expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content[0]!.text)).toMatchObject({ code: "swarm_workers_active" });
       expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
       expect(result.content[0]?.text).toContain("sbx_1");
       expect(transfer).not.toHaveBeenCalled();
@@ -725,6 +877,7 @@ async function serverFixture(
     fetchImpl?: typeof fetch;
     routerChat?: typeof import("@vapi-network/core/router-client").routerChat;
     runtime?: Runtime;
+    runtimeForStop?: (kind: Runtime["kind"]) => Runtime;
   } = {},
 ) {
   const home = await mkdtemp(join(tmpdir(), "vapi-mcp-swarm-"));
@@ -755,6 +908,7 @@ async function serverFixture(
     agentLink: { apiBase: API_BASE },
     ...(overrides.routerChat === undefined ? {} : { router: { routerChat: overrides.routerChat } }),
     ...(overrides.runtime === undefined ? {} : { runtime: overrides.runtime }),
+    ...(overrides.runtimeForStop === undefined ? {} : { runtimeForStop: overrides.runtimeForStop }),
     accounts: {
       hostname: "Test Host",
       now: () => NOW,
@@ -772,6 +926,7 @@ async function runnableSwarmFixture(options: {
   fetchImpl?: typeof fetch;
   swarm?: Pick<SwarmCapitalDeps, "balanceReader" | "transfer" | "randomId" | "randomNonce">;
   runtime?: Runtime;
+  runtimeForStop?: (kind: Runtime["kind"]) => Runtime;
   beforeReply?: (index: number) => Promise<void>;
 }) {
   const chatRequests: ChatRequest[] = [];
@@ -789,6 +944,7 @@ async function runnableSwarmFixture(options: {
     fetchImpl: options.fetchImpl ?? balanceFetch(),
     routerChat,
     ...(options.runtime === undefined ? {} : { runtime: options.runtime }),
+    ...(options.runtimeForStop === undefined ? {} : { runtimeForStop: options.runtimeForStop }),
   });
   await setupSwarm({
     home: fixture.home,
