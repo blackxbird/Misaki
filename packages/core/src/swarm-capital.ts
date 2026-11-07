@@ -35,13 +35,14 @@ import {
   SWARM_NAME_PATTERN,
   swarmAccountNames,
   SwarmError,
-  withSwarmLock,
   writeSwarm,
   type SwarmBalanceReader,
   type SwarmFile,
   type SwarmMember,
 } from "./swarm.js";
+import { withCapitalLocks } from "./swarm-lock-context.js";
 import { readUsdcBalance } from "./sweep.js";
+import { assertSwarmWorkersStopped } from "./swarm-workers.js";
 import {
   transferBetweenAccounts,
   TransferError,
@@ -234,7 +235,7 @@ export async function allocateFromTreasury(
     );
   }
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () =>
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
     allocateFromTreasuryLocked(opts, amountCents, deps, home),
   );
 }
@@ -600,7 +601,11 @@ export async function fundSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmFundResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => fundSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(
+    home,
+    { swarms: [opts.name], accounts: opts.from === undefined ? [] : [opts.from] },
+    async () => fundSwarmLocked(opts, deps, home),
+  );
 }
 
 async function fundSwarmLocked(
@@ -852,7 +857,9 @@ export async function rebalanceSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmRebalanceResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => rebalanceSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    rebalanceSwarmLocked(opts, deps, home),
+  );
 }
 
 async function rebalanceSwarmLocked(
@@ -970,7 +977,9 @@ export async function leaveSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmLeaveResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => leaveSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    leaveSwarmLocked(opts, deps, home),
+  );
 }
 
 async function leaveSwarmLocked(
@@ -1066,7 +1075,9 @@ export async function dissolveSwarm(
   deps: SwarmCapitalDeps,
 ): Promise<SwarmDissolveResult> {
   const home = capitalHome(deps);
-  return await withSwarmLock(home, opts.name, async () => dissolveSwarmLocked(opts, deps, home));
+  return await withCapitalLocks(home, { swarms: [opts.name] }, async () =>
+    dissolveSwarmLocked(opts, deps, home),
+  );
 }
 
 async function dissolveSwarmLocked(
@@ -1075,6 +1086,8 @@ async function dissolveSwarmLocked(
   home: string,
 ): Promise<SwarmDissolveResult> {
   const swarm = await readSwarm(home, opts.name);
+  await deps.reconcileRuns?.({ home, name: swarm.name });
+  await assertSwarmWorkersStopped(home, swarm);
   await assertSwarmAccountAddresses(swarm, deps);
   await reconcilePendingCeilingSweeps(swarm, swarmAccountNames(swarm), deps, home);
   const resumed = await resumeOrBlock(swarm, deps, home);
@@ -1085,6 +1098,11 @@ async function dissolveSwarmLocked(
       message: resumedMessage(resumed.movementId),
     };
   }
+
+  // Resuming pre-existing work returns without starting dissolution. Record
+  // intent only when the first dissolution sweep is about to be prepared.
+  swarm.dissolving = true;
+  await writeSwarm(home, swarm);
 
   const balanceReader = await capitalBalanceReader(swarm, deps, home);
   const memberBalances = await Promise.all(
@@ -1113,6 +1131,7 @@ async function dissolveSwarmLocked(
         {
           reason: "sweep",
           from: memberLegs[0]!.from,
+          dissolution: swarm.name,
           treasury: swarm.treasury.account,
           network: swarm.network,
           legs: memberLegs,
@@ -1143,6 +1162,7 @@ async function dissolveSwarmLocked(
         {
           reason: "sweep",
           from: swarm.treasury.account,
+          dissolution: swarm.name,
           treasury: swarm.treasury.account,
           network: swarm.network,
           legs: [{ to: "owner", amountUsd: formatUsdCents(treasuryCents), purpose: "sweep" }],

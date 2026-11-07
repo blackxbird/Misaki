@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 import {
   BASE_MAINNET_CAIP2,
+  __setAtomicFileTestHooks,
+  FileLockedError,
   withSwarmLock,
   writeSwarm,
   type AgentProfile,
@@ -49,6 +51,7 @@ const PASSPHRASE = "private-passphrase-that-must-stay-secret";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  __setAtomicFileTestHooks(undefined);
   vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories
@@ -448,6 +451,32 @@ describe("run registry", () => {
 });
 
 describe("detached swarm orchestration", () => {
+  it("skips a nested Railway member-lock timeout without rolling back started members", async () => {
+    const fixture = await detachedSwarmFixture();
+    const runtime = new FailingRuntime("railway", 99);
+    let next = 200;
+    __setAtomicFileTestHooks({
+      beforeLockAttempt(path) {
+        if (path.includes("team-helper-1") && path.endsWith(".lock"))
+          throw new FileLockedError("Member is busy");
+      },
+    });
+    const result = await startDetachedSwarmRun(
+      { name: "team", task: "Work", mode: "each", budgetUsd: "0.50" },
+      { ...fixture.deps, runtime, newRunId: () => runId(next++) },
+    );
+    expect(result.skipped).toContainEqual({
+      member: "team-helper-1",
+      role: "helper",
+      reason: "member_busy",
+    });
+    expect(runtime.stops).toEqual([]);
+    expect(runtime.starts.map(({ member }) => member.account)).toEqual([
+      "team-lead-1",
+      "team-zero-1",
+    ]);
+  });
+
   it("starts the selected lead without waiting for or taking the held swarm lock", async () => {
     const fixture = await detachedSwarmFixture();
     const runtime = new FakeRuntime();

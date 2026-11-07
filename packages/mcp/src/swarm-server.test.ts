@@ -1,9 +1,10 @@
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   BASE_MAINNET_CAIP2,
+  __setAtomicFileTestHooks,
   WalletStore,
   createAccount,
   getDefaultConfig,
@@ -11,6 +12,7 @@ import {
   readMovement,
   setupSwarm,
   usdToAtomic,
+  writeJsonAtomic,
   type ChatRequest,
   type ChatResult,
   type MovementTransfer,
@@ -24,7 +26,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
-import { listRunRecords, type Runtime, type RuntimeStatus } from "./agent/runtime.js";
+import {
+  listRunRecords,
+  startDetachedRun,
+  writeRunRecord,
+  type Runtime,
+  type RuntimeStatus,
+} from "./agent/runtime.js";
 
 const mocks = vi.hoisted(() => ({
   callService: vi.fn(),
@@ -65,6 +73,313 @@ afterEach(async () => {
 });
 
 describe("MCP swarm lifecycle", () => {
+  it.each(["swarm.fund", "swarm.rebalance", "swarm.leave", "call.pay ceiling hook"] as const)(
+    "guards legacy dissolution legs through the actual %s entry point",
+    async (tool) => {
+      const transfer = vi.fn<MovementTransfer>(async (args) => ({
+        status: "unknown",
+        from: args.from,
+        to: OWNER,
+        toName: args.to,
+        toKind: "account",
+        amountUsd: String(args.amountUsd),
+        amountAtomic: usdToAtomic(args.amountUsd).toString(),
+        network: BASE_MAINNET_CAIP2,
+        txHash: null,
+        nonce: (args.nonce ?? args.resume)!,
+        replayed: false,
+      }));
+      const fetchImpl = vi.fn<typeof fetch>(async () => {
+        throw new Error("No outbound request is permitted");
+      });
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        fetchImpl,
+        swarm: { transfer, balanceReader: async () => 1_000_000n },
+      });
+      try {
+        const initial = await fixture.server.callTool({
+          name: "swarm.dissolve",
+          arguments: { name: "team" },
+        });
+        expect(initial.isError, JSON.stringify(initial)).not.toBe(true);
+        const id = (initial.structuredContent as { movements: Array<{ movementId: string }> })
+          .movements[0]!.movementId;
+        const path = join(fixture.home, "movements", `${id}.json`);
+        const legacy = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+        delete legacy.dissolution;
+        await writeFile(path, JSON.stringify(legacy));
+        await writeJsonAtomic(
+          join(fixture.home, "runs", "run_0123456789abcdef01234567.railway.json"),
+          {
+            v: 1,
+            swarm: "team",
+            account: fixture.swarm.members[0]!.account,
+            sandboxId: "sbx_guard",
+          },
+        );
+        transfer.mockClear();
+        fetchImpl.mockClear();
+        if (tool === "call.pay ceiling hook") {
+          const actual =
+            await vi.importActual<typeof import("@vapi-network/core")>("@vapi-network/core");
+          mocks.sweepAboveCeiling.mockImplementation(actual.sweepAboveCeiling);
+          mocks.callService.mockResolvedValue({ status: 200, body: {}, payment: null });
+          await fixture.server.callTool({
+            name: "call.pay",
+            arguments: {
+              url: "https://example.com/free",
+              wallet: fixture.swarm.members[0]!.account,
+            },
+          });
+          const call = mocks.callService.mock.calls[0]?.[0] as {
+            ceilingSweep: { run(signal: AbortSignal): Promise<unknown> };
+          };
+          expect(call.ceilingSweep).toBeDefined();
+          await expect(call.ceilingSweep.run(new AbortController().signal)).resolves.toMatchObject({
+            status: "skipped",
+            reason: "unfinished_movement",
+          });
+        } else {
+          const result = await fixture.server.callTool({
+            name: tool,
+            arguments: {
+              name: "team",
+              ...(tool === "swarm.fund"
+                ? { amountUsd: 1, from: "main" }
+                : tool === "swarm.leave"
+                  ? { member: fixture.swarm.members[0]!.account }
+                  : {}),
+            },
+          });
+          expect(result.isError).toBe(true);
+          expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
+        }
+        expect(transfer).not.toHaveBeenCalled();
+        expect(fetchImpl).not.toHaveBeenCalled();
+        expect((await readMovement(fixture.home, id)).legs[0]?.status).toBe("unknown");
+      } finally {
+        await fixture.server.close();
+      }
+    },
+  );
+
+  it("serializes a Railway reservation after the eligibility check with dissolution", async () => {
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const checked = deferred();
+    const sweep = deferred();
+    const launchReached = deferred();
+    const allowLaunchLock = deferred();
+    let exporting = false;
+    let launchPending = false;
+    const transfer = vi.fn<MovementTransfer>(async (args) => {
+      expect(exporting, "no sweep may run with an exported key").toBe(false);
+      return {
+        status: "sent",
+        from: args.from,
+        to: OWNER,
+        toName: args.to,
+        toKind: "owner",
+        amountUsd: String(args.amountUsd),
+        amountAtomic: usdToAtomic(args.amountUsd).toString(),
+        network: BASE_MAINNET_CAIP2,
+        txHash: `0x${"34".repeat(32)}`,
+        nonce: (args.nonce ?? args.resume)!,
+        replayed: false,
+      };
+    });
+    const fixture = await runnableSwarmFixture({
+      replies: [],
+      swarm: {
+        transfer,
+        balanceReader: async () => {
+          checked.resolve();
+          await sweep.promise;
+          return 1_000_000n;
+        },
+      },
+    });
+    const runtime: Runtime = {
+      kind: "railway",
+      stop: vi.fn(),
+      status: async () => ({ state: "running" }),
+      start: async (member, run) => {
+        exporting = true;
+        launchReached.resolve();
+        return {
+          runId: run.runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_race",
+        };
+      },
+    };
+    __setAtomicFileTestHooks({
+      beforeLockAttempt: async (path) => {
+        if (launchPending && path === join(fixture.home, "swarms", ".team.lock")) {
+          launchReached.resolve();
+          await allowLaunchLock.promise;
+        }
+      },
+    });
+    try {
+      const dissolving = fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+      await checked.promise;
+      launchPending = true;
+      const launching = startDetachedRun({
+        home: fixture.home,
+        runtime,
+        member: { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" },
+        run: { runId: "run_0123456789abcdef01234567", task: "Work", mode: "agent" },
+      });
+      const launchOutcome = launching.then(
+        () => "started",
+        () => "refused",
+      );
+      await launchReached.promise;
+      sweep.resolve();
+      const dissolved = await dissolving;
+      allowLaunchLock.resolve();
+      expect(await launchOutcome).toBe("refused");
+      expect(dissolved.isError, JSON.stringify(dissolved)).not.toBe(true);
+      expect(dissolved.structuredContent).toMatchObject({ status: "dissolved" });
+      expect(exporting).toBe(false);
+      expect(transfer).toHaveBeenCalled();
+      expect(await listRunRecords(fixture.home)).toEqual([]);
+    } finally {
+      sweep.resolve();
+      allowLaunchLock.resolve();
+      __setAtomicFileTestHooks(undefined);
+      await fixture.server.close();
+    }
+  });
+
+  it.each(["starting", "running", "unknown"] as const)(
+    "refuses dissolution with a tracked %s Railway run before moving money",
+    async (state) => {
+      const transfer = vi.fn<MovementTransfer>(async (args) => ({
+        status: "sent",
+        from: args.from,
+        to: OWNER,
+        toName: args.to,
+        toKind: "account",
+        amountUsd: String(args.amountUsd),
+        amountAtomic: usdToAtomic(args.amountUsd).toString(),
+        network: BASE_MAINNET_CAIP2,
+        txHash: `0x${"34".repeat(32)}`,
+        nonce: (args.nonce ?? args.resume)!,
+        replayed: false,
+      }));
+      const balanceReader = vi.fn(async () => 1_000_000n);
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        swarm: { transfer, balanceReader },
+      });
+      const runId = "run_0123456789abcdef01234567";
+      const member = { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" };
+      await writeRunRecord(fixture.home, {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        run: { runId, task: "Work", mode: "agent" },
+        handle: {
+          runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_1",
+        },
+        startedAt: new Date(NOW).toISOString(),
+        state,
+      });
+
+      const result = await fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
+      expect(result.content[0]?.text).toContain("sbx_1");
+      expect(transfer).not.toHaveBeenCalled();
+      expect(balanceReader).not.toHaveBeenCalled();
+      expect(await movementFiles(fixture.home)).toEqual([]);
+      await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+      await fixture.server.close();
+    },
+  );
+
+  it.each([
+    { state: "finished" as const, sidecar: false, refused: false },
+    { state: "finished" as const, sidecar: true, refused: true },
+    { state: "unknown" as const, sidecar: false, refused: true },
+  ])(
+    "reconciles a Railway run to $state with sidecar=$sidecar before dissolution",
+    async ({ state, sidecar, refused }) => {
+      const status = vi.fn<Runtime["status"]>(async () => ({ state }));
+      const runtime: Runtime = { kind: "railway", start: vi.fn(), stop: vi.fn(), status };
+      const transfer = vi.fn<MovementTransfer>();
+      const fixture = await runnableSwarmFixture({
+        replies: [],
+        runtime,
+        swarm: { transfer, balanceReader: async () => 0n },
+      });
+      const runId = "run_0123456789abcdef01234567";
+      const member = { swarm: "team", account: fixture.swarm.members[0]!.account, profile: "lead" };
+      await writeRunRecord(fixture.home, {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        state: "running",
+        run: { runId, task: "Work", mode: "agent" },
+        handle: {
+          runId,
+          kind: "railway",
+          member,
+          startedAt: new Date(NOW).toISOString(),
+          ref: "sbx_1",
+        },
+        startedAt: new Date(NOW).toISOString(),
+      });
+      if (sidecar)
+        await writeJsonAtomic(join(fixture.home, "runs", `${runId}.railway.json`), {
+          v: 1,
+          swarm: "team",
+          sandboxId: "sbx_1",
+        });
+
+      const result = await fixture.server.callTool({
+        name: "swarm.dissolve",
+        arguments: { name: "team" },
+      });
+
+      expect(status).toHaveBeenCalledOnce();
+      expect((await listRunRecords(fixture.home))[0]?.state).toBe(state);
+      if (refused) {
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain("vapi swarm stop team --all");
+        await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+      } else {
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(result.structuredContent).toMatchObject({ status: "dissolved" });
+      }
+      expect(transfer).not.toHaveBeenCalled();
+      await fixture.server.close();
+    },
+  );
+
   it("runs swarm.setup with fundUsd twice but creates one funding movement", async () => {
     let movementId = 0;
     let nonce = 0;

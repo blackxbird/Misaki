@@ -14,6 +14,7 @@ import { basename, dirname, join } from "node:path";
 
 import {
   activeAgentMarker,
+  assertSwarmNotDissolving,
   appendAudit,
   ARC_TESTNET_CAIP2,
   CANONICAL_X402_USDC_NETWORKS,
@@ -1155,6 +1156,14 @@ async function assertNoUnresolvedAuthorizations(args: {
   account: WalletName;
   swarm: string;
 }): Promise<void> {
+  try {
+    await assertSwarmNotDissolving(args.home, args.swarm);
+  } catch (error) {
+    throw new RemoteKeyRefusedError(
+      "authorization_unresolved",
+      error instanceof Error ? error.message : "Swarm dissolution state could not be verified.",
+    );
+  }
   if (args.store.ceilingSweepPending(args.account) !== undefined) {
     throw new RemoteKeyRefusedError(
       "authorization_unresolved",

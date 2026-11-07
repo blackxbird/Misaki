@@ -4,12 +4,15 @@ import { join } from "node:path";
 import {
   createRunId,
   FileLockedError,
+  SwarmError,
   isRunId,
   readSwarm,
   RUN_ID_PATTERN,
   validateRecoveryPhrase,
   WALLET_NAME_PATTERN,
   withFileLock,
+  withSwarmLock,
+  assertSwarmNotDissolving,
   writeJsonAtomic,
   type AgentProfile,
   type WalletStore,
@@ -334,91 +337,114 @@ export async function startDetachedRun(args: {
   const lockPath = memberRunLockPath(args.home, args.member.account);
   const busyMessage = `Member ${args.member.account} is already starting a run.`;
   try {
-    return await withFileLock(
-      lockPath,
-      async () => {
-        const records = await listRunRecords(args.home, { account: args.member.account });
-        for (const record of records) {
-          const refreshed = await refreshRunRecord(args.home, record, args.runtime, args.now);
-          if (refreshed.state === "starting" || refreshed.state === "running") {
+    const launch = async () =>
+      await withFileLock(
+        lockPath,
+        async () => {
+          const records = await listRunRecords(args.home, { account: args.member.account });
+          for (const record of records) {
+            const refreshed = await refreshRunRecord(args.home, record, args.runtime, args.now);
+            if (refreshed.state === "starting" || refreshed.state === "running") {
+              throw new RuntimeError(
+                "member_busy",
+                `Member ${args.member.account} already has ${refreshed.state} run ${refreshed.runId}.${refreshed.detail === undefined ? "" : ` ${refreshed.detail}`}`,
+              );
+            }
+          }
+
+          const adapterBusy = await args.runtime.busy?.(args.member);
+          if (adapterBusy !== undefined) {
             throw new RuntimeError(
               "member_busy",
-              `Member ${args.member.account} already has ${refreshed.state} run ${refreshed.runId}.${refreshed.detail === undefined ? "" : ` ${refreshed.detail}`}`,
+              `Member ${args.member.account} is busy with unresolved run ${adapterBusy.runId}: ${adapterBusy.detail}`,
             );
           }
-        }
 
-        const adapterBusy = await args.runtime.busy?.(args.member);
-        if (adapterBusy !== undefined) {
-          throw new RuntimeError(
-            "member_busy",
-            `Member ${args.member.account} is busy with unresolved run ${adapterBusy.runId}: ${adapterBusy.detail}`,
-          );
-        }
-
-        // The runtime receives the task exactly as given, so a detached run does what an attached
-        // run would; only the stored copy is scrubbed.
-        const startedAt = (args.now?.() ?? new Date()).toISOString();
-        let reservation: RunRecord = {
-          v: 1,
-          runId: args.run.runId,
-          kind: args.runtime.kind,
-          member: args.member,
-          run: { ...args.run, task: redactRunText(args.run.task, args.env ?? process.env) },
-          handle: {
+          // The runtime receives the task exactly as given, so a detached run does what an attached
+          // run would; only the stored copy is scrubbed.
+          const startedAt = (args.now?.() ?? new Date()).toISOString();
+          let reservation: RunRecord = {
+            v: 1,
             runId: args.run.runId,
             kind: args.runtime.kind,
             member: args.member,
+            run: { ...args.run, task: redactRunText(args.run.task, args.env ?? process.env) },
+            handle: {
+              runId: args.run.runId,
+              kind: args.runtime.kind,
+              member: args.member,
+              startedAt,
+              ref: "",
+            },
             startedAt,
-            ref: "",
-          },
-          startedAt,
-          state: "starting",
-        };
-        await writeRunRecord(args.home, reservation);
-        let handle: RuntimeHandle;
-        try {
-          handle = await args.runtime.start(args.member, args.run, async (launched) => {
-            assertRecoveredHandle(reservation, launched);
-            reservation = {
-              ...reservation,
-              handle: launched,
-              startedAt: launched.startedAt,
-            };
-            await writeRunRecord(args.home, reservation);
-          });
-        } catch (error) {
-          await rm(runRecordPath(args.home, args.run.runId), { force: true }).catch(
-            () => undefined,
-          );
-          throw error;
-        }
-        const record: RunRecord = {
-          ...reservation,
-          handle,
-          startedAt: handle.startedAt,
-          state: "running",
-        };
-        try {
-          await writeRunRecord(args.home, record);
-        } catch (error) {
-          const stopped = await args.runtime.stop(handle).then(
-            () => true,
-            () => false,
-          );
-          if (stopped) {
+            state: "starting",
+          };
+          await writeRunRecord(args.home, reservation);
+          let handle: RuntimeHandle;
+          try {
+            handle = await args.runtime.start(args.member, args.run, async (launched) => {
+              assertRecoveredHandle(reservation, launched);
+              reservation = {
+                ...reservation,
+                handle: launched,
+                startedAt: launched.startedAt,
+              };
+              await writeRunRecord(args.home, reservation);
+            });
+          } catch (error) {
             await rm(runRecordPath(args.home, args.run.runId), { force: true }).catch(
               () => undefined,
             );
+            throw error;
           }
-          throw error;
+          const record: RunRecord = {
+            ...reservation,
+            handle,
+            startedAt: handle.startedAt,
+            state: "running",
+          };
+          try {
+            await writeRunRecord(args.home, record);
+          } catch (error) {
+            const stopped = await args.runtime.stop(handle).then(
+              () => true,
+              () => false,
+            );
+            if (stopped) {
+              await rm(runRecordPath(args.home, args.run.runId), { force: true }).catch(
+                () => undefined,
+              );
+            }
+            throw error;
+          }
+          return record;
+        },
+        { timeoutMs: 5_000, lockedMessage: busyMessage },
+      );
+    if (args.runtime.kind === "railway" && args.member.swarm !== undefined) {
+      // A launch needs only the swarm and run-reservation locks. Money paths
+      // pre-acquire their entire capital lock set before entering this scope.
+      // Hold the swarm lock through reservation and key issuance, including cleanup.
+      return await withSwarmLock(args.home, args.member.swarm, async () => {
+        const swarm = await readSwarm(args.home, args.member.swarm!);
+        await assertSwarmNotDissolving(args.home, swarm.name);
+        if (!swarm.members.some((member) => member.account === args.member.account)) {
+          throw new RuntimeError(
+            "runtime_unavailable",
+            `Member ${args.member.account} no longer belongs to swarm ${swarm.name}.`,
+          );
         }
-        return record;
-      },
-      { timeoutMs: 5_000, lockedMessage: busyMessage },
-    );
+        return await launch();
+      });
+    }
+    return await launch();
   } catch (error) {
-    if (error instanceof FileLockedError) throw new RuntimeError("member_busy", busyMessage);
+    if (
+      error instanceof FileLockedError ||
+      (error instanceof SwarmError && error.code === "swarm_locked")
+    ) {
+      throw new RuntimeError("member_busy", busyMessage);
+    }
     throw error;
   }
 }

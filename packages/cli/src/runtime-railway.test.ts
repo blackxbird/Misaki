@@ -612,6 +612,35 @@ describe("railway runtime unresolved authorizations", () => {
     fix: string;
   }> = [
     {
+      name: "a treasury dissolution sweep",
+      prepare: async (f) => {
+        await mkdir(join(f.home, "movements"), { recursive: true });
+        await writeFile(
+          join(f.home, "movements", "mv_dissolution.json"),
+          JSON.stringify({
+            v: 2,
+            id: "mv_dissolution",
+            reason: "sweep",
+            from: TREASURY,
+            treasury: TREASURY,
+            network: BASE_MAINNET_CAIP2,
+            createdAt: STARTED_AT,
+            legs: [
+              {
+                from: TREASURY,
+                to: "owner",
+                amountUsd: "1.00",
+                purpose: "sweep",
+                nonce: `0x${"22".repeat(32)}`,
+                status: "planned",
+              },
+            ],
+          }),
+        );
+      },
+      fix: "vapi swarm dissolve team",
+    },
+    {
       name: "a ceiling sweep",
       prepare: async (f) => {
         await f.store.updateCeilingSweepPending(ALPHA, () => ({

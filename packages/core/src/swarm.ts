@@ -25,6 +25,7 @@ import { listUnfinishedMovements, readMovement, type MovementSummary } from "./m
 import { configuredNetworkFor, formatUsdc } from "./networks.js";
 import type { SecretStore } from "./secret-store.js";
 import { readUsdcBalance } from "./sweep.js";
+import { capitalLockAccess, trackSwarmLock, withCapitalLocks } from "./swarm-lock-context.js";
 import type { TransferNetwork } from "./transfer.js";
 import { walletNameSchema, type WalletName } from "./wallet-name.js";
 import type { WalletStore } from "./wallet-store.js";
@@ -107,6 +108,8 @@ export const swarmFileSchema = z
     treasury: treasurySchema,
     members: z.array(memberSchema),
     setupFunding: setupFundingSchema.optional(),
+    /** Durable intent survives legacy legs and gaps between dissolution sweeps. */
+    dissolving: z.literal(true).optional(),
     policy: z.strictObject({
       strategy: z.enum(["targets", "even", "weights"]),
       treasuryCaps: capsSchema,
@@ -206,11 +209,26 @@ export async function withSwarmLock<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   assertName(name);
+  const access = capitalLockAccess(home, "swarm", name);
+  if (access === "outside")
+    return await withCapitalLocks(home, { swarms: [name], metadataOnly: true }, fn);
+  if (access === "reuse") return await fn();
   const path = join(swarmsDirectory(home), `.${name}.lock`);
+  let acquired = false;
   try {
-    return await withFileLock(path, fn, { lockedMessage: `Swarm ${name} is locked.` });
+    return await withFileLock(
+      path,
+      async () => {
+        acquired = true;
+        return await trackSwarmLock(home, name, fn);
+      },
+      {
+        lockedMessage: `Swarm ${name} is locked.`,
+      },
+    );
   } catch (error) {
-    if (error instanceof FileLockedError) throw new SwarmError("swarm_locked", error.message);
+    if (!acquired && error instanceof FileLockedError)
+      throw new SwarmError("swarm_locked", error.message);
     throw error;
   }
 }

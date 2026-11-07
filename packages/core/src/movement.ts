@@ -7,7 +7,11 @@ import { bytesToHex, getAddress, isAddress, type Hex } from "viem";
 import { z } from "zod";
 
 import { formatUsdCents, parseUsdCents, RELAY_MAX_PER_TRANSFER_ATOMIC } from "./allocation.js";
-import { AccountMovementLockedError, withAccountMovementLocks } from "./account-movement-lock.js";
+import {
+  AccountMovementLockedError,
+  withAccountMovementLocks,
+  withSwarmAccountMovementLocks,
+} from "./account-movement-lock.js";
 import { checkReceiptSettlement, type AuthorizationState } from "./authorization-state.js";
 import { getVapiPaths, isMissingFile, loadConfig } from "./config.js";
 import { isOpenMovementLeg } from "./movement-open.js";
@@ -17,7 +21,7 @@ import type { SecretStore } from "./secret-store.js";
 import { releaseSpend } from "./spend-policy.js";
 import { readTransferJournal, type TransferJournal } from "./transfer-journal.js";
 import {
-  transferBetweenAccounts,
+  executeTransfer,
   TransferError,
   type TransferArgs,
   type TransferNetwork,
@@ -65,6 +69,10 @@ const movementSchema = z.strictObject({
   // The only account a `sweep` leg may name besides the owner. Sweeps skip the
   // spend caps, so the parent comes from the plan, never from a leg's `to`.
   treasury: walletNameSchema.optional(),
+  dissolution: z
+    .string()
+    .regex(/^[a-z][a-z0-9-]{0,15}$/u)
+    .optional(),
   network: z.enum([BASE_MAINNET_CAIP2, ARC_MAINNET_CAIP2]),
   createdAt: z.iso.datetime(),
   legs: z.array(movementLegSchema).min(1),
@@ -100,6 +108,8 @@ export type MovementPlan = {
   reason: Movement["reason"];
   from: WalletName;
   treasury?: WalletName;
+  /** Swarm whose dissolution owns these legs, including member-to-treasury sweeps. */
+  dissolution?: string;
   network: TransferNetwork;
   legs: readonly {
     from?: WalletName;
@@ -146,6 +156,7 @@ export type MovementDependencies = {
   lockTimeoutMs?: number;
   replaceExpiredRestored?: boolean;
   bindLegacyAddresses?: boolean;
+  reconcileRuns?: TransferArgs["reconcileRuns"];
 };
 
 export class MovementError extends Error {
@@ -173,15 +184,27 @@ export async function executeMovement(
   plan: MovementPlan | { resume: string },
   deps: MovementDependencies,
 ): Promise<Movement> {
+  return await executeMovementLocked(plan, deps);
+}
+
+async function executeMovementLocked(
+  plan: MovementPlan | { resume: string },
+  deps: MovementDependencies,
+): Promise<Movement> {
   const home = deps.home ?? deps.store.home;
   if ("resume" in plan) {
     const id = parseMovementId(plan.resume);
     const initial = await readMovement(home, id);
-    return await withMovementLocks(home, movementSenders(initial), deps.lockTimeoutMs, async () => {
-      const movement = await readMovement(home, id);
-      await assertNoPendingCeilingSweep(deps, movementSenders(movement));
-      return await resumeMovement(movement, home, deps);
-    });
+    return await withCapitalMovementLocks(
+      home,
+      movementAccounts(initial),
+      deps.lockTimeoutMs,
+      async () => {
+        const movement = await readMovement(home, id);
+        await assertNoPendingCeilingSweep(deps, movementSenders(movement));
+        return await resumeMovement(movement, home, deps);
+      },
+    );
   }
 
   if (plan.legs.length === 0) {
@@ -196,46 +219,59 @@ export async function executeMovement(
   }));
   const senders = sortedUniqueSenders(legs.map((leg) => leg.from));
 
-  return await withMovementLocks(home, senders, deps.lockTimeoutMs, async () => {
-    await assertNoPendingCeilingSweep(deps, senders);
-    const conflict = await firstUnfinishedMovement(home, senders);
-    if (conflict !== undefined) {
-      throw new MovementError(
-        "unfinished_movement",
-        `Account ${conflict.from} has unfinished movement ${conflict.movement.id}. Resume it with vapi accounts distribute --resume ${conflict.movement.id}. If it cannot resume, wait for any signed authorization to expire and run vapi accounts distribute --cancel ${conflict.movement.id}.`,
-        conflict.movement.id,
-      );
-    }
-    for (const leg of legs) {
-      if (leg.purpose === "sweep" && !isOwnerSweep(leg.to) && leg.to !== plan.treasury) {
+  return await withCapitalMovementLocks(
+    home,
+    [
+      ...new Set([
+        ...senders,
+        ...legs
+          .map((leg) => leg.to)
+          .filter((to) => to !== "owner" && walletNameSchema.safeParse(to).success),
+      ]),
+    ],
+    deps.lockTimeoutMs,
+    async () => {
+      await assertNoPendingCeilingSweep(deps, senders);
+      const conflict = await firstUnfinishedMovement(home, senders);
+      if (conflict !== undefined) {
         throw new MovementError(
-          "invalid_movement",
-          "A sweep leg can only go to the owner or the movement's treasury.",
+          "unfinished_movement",
+          `Account ${conflict.from} has unfinished movement ${conflict.movement.id}. Resume it with vapi accounts distribute --resume ${conflict.movement.id}. If it cannot resume, wait for any signed authorization to expire and run vapi accounts distribute --cancel ${conflict.movement.id}.`,
+          conflict.movement.id,
         );
       }
-    }
-    const boundLegs = [];
-    for (const leg of legs) {
-      boundLegs.push(await bindLegAddresses(leg, deps));
-    }
-    const now = deps.now ?? Date.now;
-    const movement = movementSchema.parse({
-      v: 2,
-      id: (deps.randomId ?? createMovementId)(),
-      reason: plan.reason,
-      from,
-      ...(plan.treasury === undefined ? {} : { treasury: plan.treasury }),
-      network: plan.network,
-      createdAt: new Date(now()).toISOString(),
-      legs: boundLegs.map((leg) => ({
-        ...leg,
-        nonce: (deps.randomNonce ?? createMovementNonce)(),
-        status: "planned" as const,
-      })),
-    });
-    await writeMovement(home, movement);
-    return await executePlannedLegs(movement, home, deps);
-  });
+      for (const leg of legs) {
+        if (leg.purpose === "sweep" && !isOwnerSweep(leg.to) && leg.to !== plan.treasury) {
+          throw new MovementError(
+            "invalid_movement",
+            "A sweep leg can only go to the owner or the movement's treasury.",
+          );
+        }
+      }
+      const boundLegs = [];
+      for (const leg of legs) {
+        boundLegs.push(await bindLegAddresses(leg, deps));
+      }
+      const now = deps.now ?? Date.now;
+      const movement = movementSchema.parse({
+        v: 2,
+        id: (deps.randomId ?? createMovementId)(),
+        reason: plan.reason,
+        from,
+        ...(plan.treasury === undefined ? {} : { treasury: plan.treasury }),
+        ...(plan.dissolution === undefined ? {} : { dissolution: plan.dissolution }),
+        network: plan.network,
+        createdAt: new Date(now()).toISOString(),
+        legs: boundLegs.map((leg) => ({
+          ...leg,
+          nonce: (deps.randomNonce ?? createMovementNonce)(),
+          status: "planned" as const,
+        })),
+      });
+      await writeMovement(home, movement);
+      return await executePlannedLegs(movement, home, deps);
+    },
+  );
 }
 
 /** Terminates every leg that can no longer settle, without signing or relaying anything. */
@@ -870,28 +906,32 @@ async function callTransfer(
   } else if (!resume) {
     throw movementAddressUnboundError(movement);
   }
-  const transfer = deps.transfer ?? transferBetweenAccounts;
   const sweepParent = await readSweepParent(movement, leg, deps);
-  return await transfer({
-    store: deps.store,
-    secrets: deps.secrets,
-    apiBase: deps.apiBase,
-    from: leg.from,
-    to: leg.to,
-    amountUsd: leg.amountUsd,
-    network: movement.network,
-    purpose: leg.purpose,
-    expectedFromAddress: leg.fromAddress,
-    expectedToAddress: leg.toAddress,
-    ...(sweepParent === undefined ? {} : { sweepParent }),
-    home: deps.home ?? deps.store.home,
-    ...(resume ? { resume: leg.nonce as Hex } : { nonce: leg.nonce as Hex }),
-    ...(deps.unlock === undefined ? {} : { unlock: deps.unlock }),
-    ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
-    ...(deps.now === undefined ? {} : { now: deps.now }),
-    ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
-    ...(deps.ledgerPath === undefined ? {} : { ledgerPath: deps.ledgerPath }),
-  });
+  return await executeTransfer(
+    {
+      store: deps.store,
+      secrets: deps.secrets,
+      apiBase: deps.apiBase,
+      from: leg.from,
+      to: leg.to,
+      amountUsd: leg.amountUsd,
+      network: movement.network,
+      purpose: leg.purpose,
+      expectedFromAddress: leg.fromAddress,
+      expectedToAddress: leg.toAddress,
+      ...(sweepParent === undefined ? {} : { sweepParent }),
+      home: deps.home ?? deps.store.home,
+      movementId: movement.id,
+      ...(resume ? { resume: leg.nonce as Hex } : { nonce: leg.nonce as Hex }),
+      ...(deps.unlock === undefined ? {} : { unlock: deps.unlock }),
+      ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
+      ...(deps.now === undefined ? {} : { now: deps.now }),
+      ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
+      ...(deps.ledgerPath === undefined ? {} : { ledgerPath: deps.ledgerPath }),
+      ...(deps.reconcileRuns === undefined ? {} : { reconcileRuns: deps.reconcileRuns }),
+    },
+    deps.transfer,
+  );
 }
 
 async function reconcileCrash(movement: Movement, index: number, home: string): Promise<void> {
@@ -1489,36 +1529,49 @@ export function serializeMovement(movement: Movement): string {
   return `${JSON.stringify(movementSchema.parse(movement), null, 2)}\n`;
 }
 
-async function withMovementLock<T>(
-  home: string,
-  from: WalletName,
-  timeoutMs: number | undefined,
-  operation: () => Promise<T>,
-): Promise<T> {
-  try {
-    return await withAccountMovementLocks(home, [from], timeoutMs, operation);
-  } catch (error) {
-    if (error instanceof AccountMovementLockedError) {
-      throw new MovementError(
-        "movement_locked",
-        `Another movement is already running for account ${from}.`,
-      );
-    }
-    throw error;
-  }
-}
-
 async function withMovementLocks<T>(
   home: string,
   senders: readonly WalletName[],
   timeoutMs: number | undefined,
   operation: () => Promise<T>,
 ): Promise<T> {
-  const [sender, ...remaining] = senders;
-  if (sender === undefined) return await operation();
-  return await withMovementLock(home, sender, timeoutMs, async () =>
-    withMovementLocks(home, remaining, timeoutMs, operation),
+  return await mapMovementLockError(
+    async () => await withAccountMovementLocks(home, senders, timeoutMs, operation),
   );
+}
+
+function movementAccounts(movement: Movement): WalletName[] {
+  return [
+    ...new Set(
+      movement.legs
+        .flatMap((leg) => [leg.from, leg.to])
+        .filter((name) => name !== "owner" && walletNameSchema.safeParse(name).success),
+    ),
+  ];
+}
+
+async function withCapitalMovementLocks<T>(
+  home: string,
+  senders: readonly WalletName[],
+  timeoutMs: number | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return await mapMovementLockError(
+    async () => await withSwarmAccountMovementLocks(home, senders, timeoutMs, operation),
+  );
+}
+
+async function mapMovementLockError<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (error instanceof AccountMovementLockedError)
+      throw new MovementError(
+        "movement_locked",
+        `Another movement is already running for account ${error.account}.`,
+      );
+    throw error;
+  }
 }
 
 async function assertNoPendingCeilingSweep(

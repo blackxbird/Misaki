@@ -113,6 +113,8 @@ export * from "./stats.js";
 export * from "./spend-policy.js";
 export * from "./spend-cap-exceeded.js";
 export * from "./swarm-capital.js";
+export { withCapitalLocks, type CapitalLockRequest } from "./swarm-lock-context.js";
+export { assertSwarmNotDissolving } from "./swarm-dissolution.js";
 export * from "./swarm.js";
 export * from "./status.js";
 export * from "./support-report.js";
@@ -134,6 +136,7 @@ export * from "./wallet-store.js";
 export * from "./x402.js";
 export * from "./remote-account.js";
 export * from "./x402-pay.js";
+export type { PaymentWarning } from "./payment-warning.js";
 export {
   ARC_MAINNET_CAIP2,
   BROWSER_ENABLED_X402_NETWORK_CONFIG,

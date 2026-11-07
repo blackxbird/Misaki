@@ -1773,6 +1773,27 @@ describe("vapi sweep destinations", () => {
     expect(message).toContain("vapi login");
   });
 
+  it("plans same-key aliases before the outer sweep lock", async () => {
+    const home = await initializedHome("vapi-cli-sweep-alias-");
+    const store = await WalletStore.open(home, { secrets: sharedSecretStore(home) });
+    await store.importKey("first-alias", "", IMPORTED_KEY);
+    await store.importKey("second-alias", "", IMPORTED_KEY);
+    const sweepBack = successfulSweep();
+    const captured = captureIo();
+    expect(
+      await runCli(
+        ["sweep", explicit, "--wallet", "first-alias", "--network", BASE_MAINNET_CAIP2, "--json"],
+        captured.io,
+        { sweepBack },
+      ),
+    ).toBe(0);
+    expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+      wallet: "first-alias",
+      results: [{ status: "swept" }],
+    });
+    expect(sweepBack).toHaveBeenCalledOnce();
+  });
+
   it("keeps an explicit destination unchanged", async () => {
     await initializedHome("vapi-cli-sweep-explicit-");
     const sweepBack = successfulSweep();

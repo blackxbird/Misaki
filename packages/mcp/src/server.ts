@@ -44,7 +44,7 @@ import {
   type VapiConfig,
   type WalletStore,
 } from "@vapi-network/core";
-import { routerChat as coreRouterChat } from "@vapi-network/core/router-client";
+import { routerChat as coreRouterChat, RouterClientError } from "@vapi-network/core/router-client";
 import { z } from "zod";
 
 import { accountsSend } from "./actions/accounts.js";
@@ -821,6 +821,12 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     ...(options.ledgerPath === undefined ? {} : { ledgerPath: options.ledgerPath }),
     ...(accountsOptions.now === undefined ? {} : { now: accountsOptions.now }),
     ...options.swarm,
+    reconcileRuns: async ({ home, name }) => {
+      const records = await listRunRecords(home, { swarm: name });
+      for (const record of records) {
+        await refreshRunRecord(home, record, options.runtime);
+      }
+    },
     unlock: async (account) => {
       const selected = await session.payment(account);
       return {
@@ -1562,6 +1568,15 @@ export async function loadServerConfig() {
 }
 
 export function toolError(error: unknown) {
+  if (error instanceof RouterClientError && error.refill !== undefined) {
+    const payload = error.toJSON();
+    return {
+      isError: true as const,
+      structuredContent: payload,
+      content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+    };
+  }
+
   const spendCapError = serializeSpendCapError(error);
   const text =
     spendCapError !== undefined

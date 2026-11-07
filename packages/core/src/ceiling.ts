@@ -2,7 +2,10 @@ import { randomBytes } from "node:crypto";
 
 import { bytesToHex, getAddress, isAddress, type Hex } from "viem";
 
-import { AccountMovementLockedError, withAccountMovementLock } from "./account-movement-lock.js";
+import {
+  AccountMovementLockedError,
+  withSwarmAccountMovementLocks,
+} from "./account-movement-lock.js";
 import { appendAudit, type AuditRecord } from "./audit.js";
 import { checkReceiptSettlement, type AuthorizationState } from "./authorization-state.js";
 import { getVapiPaths, type VapiConfig } from "./config.js";
@@ -14,7 +17,7 @@ import type { SecretStore } from "./secret-store.js";
 import { fetchSiblings, SiblingsError, type SiblingsResult } from "./siblings.js";
 import { readUsdcBalance } from "./sweep.js";
 import {
-  transferBetweenAccounts,
+  executeTransfer,
   TransferError,
   type TransferArgs,
   type TransferResult,
@@ -363,24 +366,27 @@ async function executePendingSweep(input: {
     : currentSweepParent;
 
   try {
-    const result = await (args.transfer ?? transferBetweenAccounts)({
-      store: args.store,
-      secrets: args.secrets,
-      apiBase: args.apiBase,
-      from: args.account,
-      to: target,
-      amountUsd,
-      network: "base",
-      purpose: "sweep",
-      ...(sweepParent === undefined ? {} : { sweepParent }),
-      ...(resume ? { resume: pending.nonce as Hex } : { nonce: pending.nonce as Hex }),
-      unlock: guardedSweepUnlock(args, address, owner, amountAtomic, readBalance),
-      ...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
-      ...(args.signal === undefined ? {} : { signal: args.signal }),
-      now,
-      timeoutMs: args.timeoutMs ?? CEILING_SWEEP_TIMEOUT_MS,
-      home: auditHome,
-    });
+    const result = await executeTransfer(
+      {
+        store: args.store,
+        secrets: args.secrets,
+        apiBase: args.apiBase,
+        from: args.account,
+        to: target,
+        amountUsd,
+        network: "base",
+        purpose: "sweep",
+        ...(sweepParent === undefined ? {} : { sweepParent }),
+        ...(resume ? { resume: pending.nonce as Hex } : { nonce: pending.nonce as Hex }),
+        unlock: guardedSweepUnlock(args, address, owner, amountAtomic, readBalance),
+        ...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
+        ...(args.signal === undefined ? {} : { signal: args.signal }),
+        now,
+        timeoutMs: args.timeoutMs ?? CEILING_SWEEP_TIMEOUT_MS,
+        home: auditHome,
+      },
+      args.transfer,
+    );
 
     if (result.status === "unknown") {
       await args.store.updateCeilingSweepPending(args.account, (current) =>
@@ -666,9 +672,9 @@ async function withCeilingSweepLock<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
   try {
-    return await withAccountMovementLock(
+    return await withSwarmAccountMovementLocks(
       args.store.home,
-      args.account,
+      [args.account],
       args.timeoutMs ?? CEILING_SWEEP_TIMEOUT_MS,
       operation,
       args.signal,

@@ -14,7 +14,9 @@ import { sweepAboveCeiling } from "./ceiling.js";
 import type { SpendCaps, VapiConfig } from "./config.js";
 import type { VapiPaymentAccount } from "./keystore.js";
 import { createPublicFetch } from "./net-guard.js";
+import { formatUsdc } from "./networks.js";
 import type { Receipt } from "./receipts.js";
+import type { PaymentWarning } from "./payment-warning.js";
 import type { RunBudget } from "./run-budget.js";
 import type { SecretStore } from "./secret-store.js";
 import { SpendCapExceededError } from "./spend-cap-exceeded.js";
@@ -55,6 +57,8 @@ export type ChatRequest = {
 };
 
 export type ChatResult = {
+  /** A successful automatic purchase, including any post-payment warnings. */
+  refill?: RouterPurchaseResult;
   content: string | null;
   toolCalls: Array<{ id: string; name: string; arguments: string }>;
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
@@ -76,12 +80,53 @@ export type AgentRouterUsage = {
 
 export class RouterClientError extends Error {
   constructor(
-    readonly code: "not_linked" | "no_router_key" | "budget_exhausted" | "rate_limited" | "http",
+    readonly code:
+      | "not_linked"
+      | "no_router_key"
+      | "budget_exhausted"
+      | "rate_limited"
+      | "http"
+      | "refill_pending",
     message: string,
     readonly status?: number,
+    /** A settled refill whose subsequent chat could not complete. Never repeat its payment. */
+    readonly refill?: RouterPurchaseResult,
   ) {
     super(message);
     this.name = "RouterClientError";
+  }
+
+  /** Public payment evidence for CLI/MCP errors, without credential or provider fields. */
+  toJSON() {
+    const purchase = this.refill;
+    return {
+      code: this.code,
+      message: this.message,
+      ...(purchase === undefined
+        ? {}
+        : {
+            refill: {
+              receipt: {
+                id: purchase.receipt.id,
+                ...routerPurchaseSummary(purchase.receipt),
+                ...(purchase.receipt.settlement?.transaction === undefined
+                  ? {}
+                  : { transaction: purchase.receipt.settlement.transaction }),
+              },
+              balance:
+                purchase.balance === null
+                  ? null
+                  : {
+                      purchasedUsd: purchase.balance.purchasedUsd,
+                      spentUsd: purchase.balance.spentUsd,
+                      remainingUsd: purchase.balance.remainingUsd,
+                    },
+              ...(purchase.warnings === undefined
+                ? {}
+                : { warnings: purchase.warnings.map(({ code, message }) => ({ code, message })) }),
+            },
+          }),
+    };
   }
 }
 
@@ -220,6 +265,33 @@ export async function routerUsage(deps: RouterClientDeps): Promise<AgentRouterUs
   return parsed.data;
 }
 
+/** Public facts about a completed purchase, without guessing from its requested tier. */
+export function routerPurchaseSummary(receipt: Receipt): {
+  amountUsd: number | null;
+  network: string;
+} {
+  const atomic = receipt.quote?.amountAtomic;
+  const amount =
+    atomic !== undefined && /^\d+$/u.test(atomic) ? Number(formatUsdc(BigInt(atomic))) : null;
+  const settlement = z
+    .object({ network: z.string().trim().min(1) })
+    .safeParse(receipt.settlement?.evidence);
+  return {
+    amountUsd: amount !== null && Number.isFinite(amount) ? amount : null,
+    network:
+      receipt.quote?.network?.trim() || (settlement.success ? settlement.data.network : "unknown"),
+  };
+}
+
+export type RouterPurchaseWarning = PaymentWarning;
+
+export type RouterPurchaseResult = {
+  receipt: Receipt;
+  balance: AgentRouterUsage["balance"];
+  /** Post-payment failures; the receipt remains authoritative. Never retry the purchase for these. */
+  warnings?: RouterPurchaseWarning[];
+};
+
 export async function buyRouterBalance(
   deps: RouterClientDeps & {
     account: VapiPaymentAccount;
@@ -232,12 +304,16 @@ export async function buyRouterBalance(
     run?: RunRef;
   },
   tierUsd: RouterTopupTier,
-): Promise<{ receipt: Receipt; balance: AgentRouterUsage["balance"] }> {
+): Promise<RouterPurchaseResult> {
   if (!isRouterTopupTier(tierUsd)) {
     throw new RouterClientError("http", "Router balance must use a $1, $5, $20, or $50 tier.");
   }
   const { link, accessToken } = await purchaseCredentialSnapshot(deps);
-  const { response, receipt } = await payRequest({
+  const {
+    response,
+    receipt,
+    warnings: paymentWarnings,
+  } = await payRequest({
     url: `${trimTrailingSlashes(link.apiBase)}/api/router/top-up/${tierUsd}`,
     init: {
       method: "POST",
@@ -275,7 +351,7 @@ export async function buyRouterBalance(
         }),
     },
   });
-  if (!response.ok) {
+  if (!response.ok && receipt.settlement?.outcome !== "succeeded") {
     if (response.status === 401) await verifyAgentLink(deps);
     throw new RouterClientError(
       "http",
@@ -284,28 +360,55 @@ export async function buyRouterBalance(
     );
   }
 
-  await appendAudit(
-    deps.wallets.home,
-    {
-      event: "router.buy",
-      wallet: deps.wallet,
-      owner: link.owner,
-      tty: Boolean(process.stderr.isTTY),
-      detail: `$${tierUsd} on ${receipt.quote?.network ?? "eip155:8453"}`,
-    },
-    deps.now === undefined ? {} : { now: () => deps.now! },
-  );
+  const warnings: RouterPurchaseWarning[] = [...(paymentWarnings ?? [])];
+  if (!response.ok)
+    warnings.push({
+      code: "purchase_response_unavailable",
+      message:
+        "Payment succeeded, but the Router purchase response was unsuccessful. Keep the returned receipt and check vapi router usage; do not repeat the purchase.",
+    });
+  try {
+    const purchase = routerPurchaseSummary(receipt);
+    await appendAudit(
+      deps.wallets.home,
+      {
+        event: "router.buy",
+        wallet: deps.wallet,
+        owner: link.owner,
+        tty: Boolean(process.stderr.isTTY),
+        detail: `${purchase.amountUsd === null ? "amount unknown" : `$${purchase.amountUsd}`} on ${purchase.network}`,
+      },
+      deps.now === undefined ? {} : { now: () => deps.now! },
+    );
+  } catch {
+    warnings.push({
+      code: "audit_unavailable",
+      message:
+        "Payment succeeded, but the local purchase audit could not be written. Keep the returned receipt; do not repeat the purchase.",
+    });
+  }
 
   try {
     await ensureBalanceRouterKey(deps, link);
   } catch {
-    throw new RouterClientError(
-      "http",
-      "The Router balance payment went through, but its key could not be fetched or stored. It can be fetched on the next chat/buy.",
-    );
+    warnings.push({
+      code: "router_key_unavailable",
+      message:
+        "Payment succeeded, but its Router balance key could not be fetched or stored. Retry chat to fetch the key; do not repeat the purchase.",
+    });
   }
 
-  return { receipt, balance: (await routerUsage(deps)).balance };
+  let balance: AgentRouterUsage["balance"] = null;
+  try {
+    balance = (await routerUsage(deps)).balance;
+  } catch {
+    warnings.push({
+      code: "balance_unavailable",
+      message:
+        "Payment succeeded, but the Router balance is unavailable. Check vapi router usage before buying again.",
+    });
+  }
+  return { receipt, balance, ...(warnings.length === 0 ? {} : { warnings }) };
 }
 
 export async function routerChat(
@@ -333,6 +436,7 @@ export async function routerChat(
     }
     const resetsAt = usage?.compute.resetsAt ?? "00:00 UTC";
     let balance = usage?.balance;
+    let purchase: RouterPurchaseResult | undefined;
     const refill = deps.wallets.entry(deps.wallet)?.routerRefill;
 
     if (
@@ -346,29 +450,27 @@ export async function routerChat(
           resolveRefillValue(deps.refill.account),
           resolveRefillValue(deps.refill.caps),
         ]);
-        balance = (
-          await buyRouterBalance(
-            {
-              ...deps,
-              account,
-              config: deps.refill.config,
-              caps,
-              ...(deps.refill.paths === undefined ? {} : { paths: deps.refill.paths }),
-              ...(deps.refill.now === undefined
-                ? {}
-                : {
-                    now:
-                      typeof deps.refill.now === "function" ? deps.refill.now() : deps.refill.now,
-                  }),
-              ...(deps.refill.allowanceExpiresAt === undefined
-                ? {}
-                : { allowanceExpiresAt: deps.refill.allowanceExpiresAt }),
-              ...(deps.refill.runBudget === undefined ? {} : { runBudget: deps.refill.runBudget }),
-              ...(deps.refill.run === undefined ? {} : { run: deps.refill.run }),
-            },
-            refill.tierUsd,
-          )
-        ).balance;
+        purchase = await buyRouterBalance(
+          {
+            ...deps,
+            account,
+            config: deps.refill.config,
+            caps,
+            ...(deps.refill.paths === undefined ? {} : { paths: deps.refill.paths }),
+            ...(deps.refill.now === undefined
+              ? {}
+              : {
+                  now: typeof deps.refill.now === "function" ? deps.refill.now() : deps.refill.now,
+                }),
+            ...(deps.refill.allowanceExpiresAt === undefined
+              ? {}
+              : { allowanceExpiresAt: deps.refill.allowanceExpiresAt }),
+            ...(deps.refill.runBudget === undefined ? {} : { runBudget: deps.refill.runBudget }),
+            ...(deps.refill.run === undefined ? {} : { run: deps.refill.run }),
+          },
+          refill.tierUsd,
+        );
+        balance = purchase.balance;
       } catch (refillError) {
         await appendAudit(deps.wallets.home, {
           event: "router.refill.declined",
@@ -383,37 +485,63 @@ export async function routerChat(
       }
     }
 
-    const mayHaveBalance = usage === undefined || (balance?.remainingUsd ?? 0) > 0;
-    if (mayHaveBalance) {
-      const balanceCredentials = await routerBalanceCredentialSnapshot(deps);
-      if (balanceCredentials !== undefined) {
-        try {
-          return await sendRouterChat(
-            deps,
-            balanceCredentials.routerBaseUrl,
-            balanceCredentials.routerKey,
-            request,
-            "balance",
-          );
-        } catch (balanceError) {
-          if (
-            balanceError instanceof RouterClientError &&
-            balanceError.code === "budget_exhausted"
-          ) {
-            throw budgetExhaustedError(resetsAt, error.status);
+    let balanceKeyAvailable = false;
+    try {
+      const mayHaveBalance =
+        usage === undefined || purchase !== undefined || (balance?.remainingUsd ?? 0) > 0;
+      if (mayHaveBalance) {
+        let balanceCredentials = await routerBalanceCredentialSnapshot(deps);
+        // A prior paid refill may not have stored its key. Recover it without a
+        // purchase on the next chat request; credential-only SDK reads stay local.
+        if (balanceCredentials === undefined && purchase === undefined && refill !== undefined) {
+          await ensureBalanceRouterKey(deps, await linkedWallet(deps));
+          balanceCredentials = await routerBalanceCredentialSnapshot(deps);
+        }
+        if (balanceCredentials !== undefined) {
+          balanceKeyAvailable = true;
+          try {
+            const result = await sendRouterChat(
+              deps,
+              balanceCredentials.routerBaseUrl,
+              balanceCredentials.routerKey,
+              request,
+              "balance",
+            );
+            return { ...result, ...(purchase === undefined ? {} : { refill: purchase }) };
+          } catch (balanceError) {
+            if (
+              balanceError instanceof RouterClientError &&
+              balanceError.code === "budget_exhausted"
+            ) {
+              throw budgetExhaustedError(resetsAt, error.status);
+            }
+            if (
+              balanceError instanceof RouterClientError &&
+              balanceError.code === "no_router_key" &&
+              balanceError.status === 401
+            ) {
+              await removeRejectedBalanceKey(deps, balanceCredentials).catch(() => undefined);
+            }
+            throw balanceError;
           }
-          if (
-            balanceError instanceof RouterClientError &&
-            balanceError.code === "no_router_key" &&
-            balanceError.status === 401
-          ) {
-            await removeRejectedBalanceKey(deps, balanceCredentials).catch(() => undefined);
-          }
-          throw balanceError;
         }
       }
+      throw budgetExhaustedError(resetsAt, error.status);
+    } catch (followupError) {
+      if (purchase === undefined) throw followupError;
+      const payment =
+        purchase.receipt.settlement?.outcome === "succeeded"
+          ? "Payment settled"
+          : "The Router purchase returned a receipt";
+      throw new RouterClientError(
+        "refill_pending",
+        balanceKeyAvailable
+          ? `${payment}, but chat could not complete. Retry chat; do not repeat the purchase.`
+          : `${payment}, but the Router balance key is not yet available. It will be fetched on the next request. Retry chat; do not repeat the purchase.`,
+        followupError instanceof RouterClientError ? followupError.status : undefined,
+        purchase,
+      );
     }
-    throw budgetExhaustedError(resetsAt, error.status);
   }
 }
 

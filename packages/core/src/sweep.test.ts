@@ -1,3 +1,4 @@
+import { readFile, readdir } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -131,3 +132,18 @@ function noGasSweepRpc(message: string, chainId: string) {
     return Response.json({ jsonrpc: "2.0", id: request.id, result });
   });
 }
+
+it("keeps raw sweep broadcasting private to the guarded transfer module", async () => {
+  const transfer = await import("./transfer.js");
+  expect(transfer).not.toHaveProperty("broadcastSweep");
+  expect(transfer).not.toHaveProperty("performTransfer");
+  const sweepSource = await readFile(new URL("./sweep.ts", import.meta.url), "utf8");
+  expect(sweepSource).not.toContain(".writeContract(");
+  for (const name of await readdir(new URL(".", import.meta.url))) {
+    if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
+    const source = await readFile(new URL(name, import.meta.url), "utf8");
+    expect(source, name).not.toMatch(
+      /(?:import|export)\s+(?:type\s+)?\{[^}]*\b(?:broadcastSweep|performTransfer)\b/s,
+    );
+  }
+});
