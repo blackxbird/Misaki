@@ -18,6 +18,7 @@ import type { Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { readAuditLog } from "./audit.js";
+import { __setAtomicFileTestHooks } from "./atomic-file.js";
 import { withAccountMovementLock } from "./account-movement-lock.js";
 import { DEFAULT_CEILING_ATOMIC, DEFAULT_SPEND_CAPS, getVapiPaths } from "./config.js";
 import {
@@ -65,6 +66,7 @@ const temporaryDirectories: string[] = [];
 const secretStores = new Map<string, SecretStore>();
 
 afterEach(async () => {
+  __setAtomicFileTestHooks(undefined);
   delete process.env.VAPI_WALLET;
   const directories = temporaryDirectories.splice(0);
   for (const directory of directories) secretStores.delete(directory);
@@ -884,6 +886,98 @@ describe("wallet store", () => {
       key.fill(0);
     },
     SLOW,
+  );
+
+  it.each(["rename", "remove"] as const)(
+    "refuses %s while a Router purchase is pending, then permits it after clearing",
+    async (operation) => {
+      const home = await makeHome();
+      const store = await openStore(home);
+      await store.create("main", PASSPHRASE);
+      await store.create("agent", PASSPHRASE);
+      const stale = await openStore(home);
+      const pending = {
+        receiptId: "account-change-guard",
+        status: "prepared" as const,
+        createdAt: "2026-11-07T10:00:00.000Z",
+        tierUsd: 5 as const,
+        link: {
+          apiBase: "https://console.example",
+          clientId: "client",
+          owner: "0x1111111111111111111111111111111111111111" as const,
+          label: "test",
+          scopes: [],
+          linkedAt: "2026-11-07T10:00:00.000Z",
+        },
+      };
+      await store.setRouterPendingPurchase("agent", pending);
+      const evidencePath = join(home, "router-pending", "agent.json");
+      const evidence = await readFile(evidencePath, "utf8");
+      const change = () =>
+        operation === "rename"
+          ? stale.rename("agent", "renamed-agent")
+          : stale.remove("agent", { force: true });
+      await expect(change()).rejects.toThrow(/Router purchase.*vapi router clear-pending/iu);
+      expect(await readFile(evidencePath, "utf8")).toBe(evidence);
+      const reopened = await openStore(home);
+      expect(reopened.has("agent")).toBe(true);
+      expect(reopened.has("renamed-agent")).toBe(false);
+      expect(
+        (await readVaultFileUnlocked(join(home, "vault.json"))).accounts.some(
+          (entry) => entry.name === "agent",
+        ),
+      ).toBe(true);
+      await reopened.setRouterPendingPurchase("agent", null, pending.receiptId);
+      await expect(change()).resolves.toMatchObject({
+        name: operation === "rename" ? "renamed-agent" : "agent",
+      });
+    },
+  );
+
+  it.each(["rename", "remove"] as const)(
+    "waits for the Router purchase lock before deciding whether to %s",
+    async (operation) => {
+      const home = await makeHome();
+      const store = await openStore(home);
+      await store.create("main", PASSPHRASE);
+      await store.create("agent", PASSPHRASE);
+      const stale = await openStore(home);
+      let attempted!: () => void;
+      const attempting = new Promise<void>((resolve) => {
+        attempted = resolve;
+      });
+      let changing: Promise<unknown> | undefined;
+      await store.withRouterPurchaseLock("agent", async () => {
+        __setAtomicFileTestHooks({
+          beforeLockAttempt: (path) => {
+            if (path === join(home, "router-pending", "agent.json.purchase.lock")) attempted();
+          },
+        });
+        changing =
+          operation === "rename"
+            ? stale.rename("agent", "renamed-agent")
+            : stale.remove("agent", { force: true });
+        await attempting;
+        await store.setRouterPendingPurchase("agent", {
+          receiptId: "reserved-while-mutation-waits",
+          status: "prepared",
+          createdAt: "2026-11-07T10:00:00.000Z",
+          tierUsd: 5,
+          link: {
+            apiBase: "https://console.example",
+            clientId: "client",
+            owner: "0x1111111111111111111111111111111111111111",
+            label: "test",
+            scopes: [],
+            linkedAt: "2026-11-07T10:00:00.000Z",
+          },
+        });
+      });
+      await expect(changing).rejects.toThrow(/Router purchase.*vapi router clear-pending/iu);
+      expect((await openStore(home)).entry("agent")?.routerPendingPurchase?.receiptId).toBe(
+        "reserved-while-mutation-waits",
+      );
+    },
   );
 
   it(

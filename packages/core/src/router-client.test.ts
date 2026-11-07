@@ -13,6 +13,7 @@ import {
   type AgentTokens,
 } from "./agent-link.js";
 import { readAuditLog } from "./audit.js";
+import { drainCeilingSweeps } from "./ceiling.js";
 import { DEFAULT_SPEND_CAPS, getDefaultConfig } from "./config.js";
 import { NETWORKS } from "./networks.js";
 import { readReceipts } from "./receipts.js";
@@ -35,6 +36,7 @@ import { SpendCapExceededError } from "./spend-cap-exceeded.js";
 import { readSpendLedger } from "./spend-policy.js";
 import { BASE_MAINNET_CAIP2 } from "./x402-networks.js";
 import { WalletStore, type AgentLink } from "./wallet-store.js";
+import { purchaseTransport } from "../../../test-fixtures/router-purchase.js";
 
 const API_BASE = "https://console.example";
 const ROUTER_BASE = "https://router.example/gateway/";
@@ -51,6 +53,7 @@ const directories: string[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
+  await drainCeilingSweeps();
   vi.restoreAllMocks();
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
@@ -238,6 +241,380 @@ function usageResponse() {
 }
 
 describe("routerChat", () => {
+  it("keeps an interrupted purchase blocking even when an older balance key exists", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await linkedDeps(fetchImpl, {
+      balanceKey: BALANCE_KEY,
+      routerRefill: { belowUsd: 1, tierUsd: 5 },
+    });
+    await deps.wallets.setRouterPendingPurchase("main", {
+      receiptId: "interrupted-purchase",
+      status: "unknown",
+      createdAt: NOW.toISOString(),
+      tierUsd: 5,
+      link: deps.wallets.entry("main")!.link!,
+    });
+    const wallets = await WalletStore.open(deps.wallets.home);
+    const account = vi.fn(async () => privateKeyToAccount(PRIVATE_KEY));
+    await expect(
+      routerChat(
+        { ...deps, wallets, refill: { ...refillOptions(wallets), account } },
+        {
+          model: "model",
+          messages: [],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "refill_pending",
+      refill: { receipt: { id: "interrupted-purchase", outcome: "settlement_unknown" } },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(account).not.toHaveBeenCalled();
+    expect(
+      (await WalletStore.open(wallets.home)).entry("main")?.routerPendingPurchase?.receiptId,
+    ).toBe("interrupted-purchase");
+  });
+
+  it("retains a settled purchase when its original agent link is no longer active", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const transport = purchaseTransport(deps.wallets.home, "key", ROUTER_BASE);
+    const purchase = await buyRouterBalance(
+      { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+      5,
+    );
+    await deps.wallets.setLink("main", agentLink({ clientId: "new-client" }));
+    const fetchImpl = vi.fn<typeof fetch>();
+    const wallets = await WalletStore.open(deps.wallets.home);
+    await expect(
+      routerChat({ ...deps, wallets, fetchImpl }, { model: "model", messages: [] }),
+    ).rejects.toMatchObject({
+      code: "refill_pending",
+      refill: { receipt: { id: purchase.receipt.id, settlement: { outcome: "succeeded" } } },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(
+      (await WalletStore.open(wallets.home)).entry("main")?.routerPendingPurchase?.receiptId,
+    ).toBe(purchase.receipt.id);
+  });
+
+  it("recovers a missing balance key without an automatic-refill setting", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      if (url.host === "router.example") {
+        if (request.headers.get("authorization") === `Bearer ${ROUTER_KEY}`)
+          return new Response("Budget has been exceeded", { status: 429 });
+        expect(request.headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+        return Response.json({ choices: [{ message: { content: "manual purchase recovered" } }] });
+      }
+      if (url.pathname === "/api/agents/self/router") return Response.json(usageResponse());
+      if (url.pathname === "/api/agents/self/router-balance-key")
+        return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+      throw new Error("A recovery request must not purchase.");
+    });
+    const deps = await linkedDeps(fetchImpl);
+    await expect(routerChat(deps, { model: "model", messages: [] })).resolves.toMatchObject({
+      content: "manual purchase recovered",
+      keyUsed: "balance",
+    });
+    expect(deps.secrets.entries[agentSecretAccounts("main").routerBalance]).toBe(BALANCE_KEY);
+  });
+
+  it.each([
+    { auto: true, recordWriteFails: false },
+    { auto: false, recordWriteFails: false },
+    { auto: true, recordWriteFails: true },
+  ])(
+    "recovers a durable settled purchase after restart before any refill (auto=$auto, record write fails=$recordWriteFails)",
+    async ({ auto, recordWriteFails }) => {
+      let paid = 0;
+      const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        if (url.pathname === "/api/router/top-up/5") {
+          if (!request.headers.has("payment-signature")) return topupRequired(5);
+          paid++;
+          return topupAccepted(5);
+        }
+        if (url.pathname === "/api/agents/self/router-balance-key")
+          return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+        if (url.pathname === "/api/agents/self/router")
+          return Response.json({
+            ...usageResponse(),
+            balance: { purchasedUsd: 0, spentUsd: 0, remainingUsd: 0 },
+          });
+        if (url.host === "router.example") {
+          if (request.headers.get("authorization") === `Bearer ${ROUTER_KEY}`)
+            return new Response("Budget has been exceeded", { status: 429 });
+          expect(request.headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+          return Response.json({ choices: [{ message: { content: "recovered without paying" } }] });
+        }
+        throw new Error(`Unexpected URL ${url}`);
+      });
+      const deps = await linkedDeps(
+        fetchImpl,
+        auto ? { routerRefill: { belowUsd: 1, tierUsd: 5 } } : {},
+      );
+      if (recordWriteFails) {
+        const original = deps.wallets.setRouterPendingPurchase.bind(deps.wallets);
+        vi.spyOn(deps.wallets, "setRouterPendingPurchase").mockImplementation(
+          async (name, pending, expected) => {
+            if (pending?.status === "settled") throw new Error("private-pending-write-error");
+            return await original(name, pending, expected);
+          },
+        );
+      }
+      const balanceAccount = agentSecretAccounts("main").routerBalance;
+      const set = deps.secrets.set.bind(deps.secrets);
+      const failure = vi.spyOn(deps.secrets, "set").mockImplementation(async (name, value) => {
+        if (name === balanceAccount) throw new Error("private-keystore-write-failure");
+        await set(name, value);
+      });
+      const purchase = await buyRouterBalance({ ...deps, ...refillOptions(deps.wallets) }, 5);
+      expect(paid).toBe(1);
+      expect(deps.secrets.entries[balanceAccount]).toBeUndefined();
+      const onDisk = JSON.parse(
+        await readFile(join(deps.wallets.home, "router-pending", "main.json"), "utf8"),
+      );
+      failure.mockRestore();
+      const wallets = await WalletStore.open(deps.wallets.home);
+      const account = vi.fn(async () => privateKeyToAccount(PRIVATE_KEY));
+      const result = await routerChat(
+        { ...deps, wallets, refill: { ...refillOptions(wallets), account } },
+        { model: "model", messages: [] },
+      );
+      expect(paid).toBe(1);
+      expect(account).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        content: "recovered without paying",
+        keyUsed: "balance",
+        refill: {
+          receipt: {
+            id: purchase.receipt.id,
+            settlement: {
+              outcome: "succeeded",
+              transaction: purchase.receipt.settlement!.transaction,
+            },
+          },
+        },
+      });
+      expect(deps.secrets.entries[balanceAccount]).toBe(BALANCE_KEY);
+      expect(onDisk.pending).toMatchObject(
+        recordWriteFails
+          ? { receiptId: purchase.receipt.id, status: "signed" }
+          : {
+              receiptId: purchase.receipt.id,
+              status: "settled",
+              network: BASE_MAINNET_CAIP2,
+              amountAtomic: "5000000",
+              transaction: purchase.receipt.settlement!.transaction,
+            },
+      );
+      expect((await WalletStore.open(wallets.home)).entry("main")).not.toHaveProperty(
+        "routerPendingPurchase",
+      );
+      for (const secret of [ACCESS_TOKEN, BALANCE_KEY, PRIVATE_KEY])
+        expect(JSON.stringify(onDisk)).not.toContain(secret);
+    },
+  );
+
+  it.each(["key", "console", "chat"] as const)(
+    "retains the previous paid receipt through restart recovery failure (%s)",
+    async (failure) => {
+      let paid = 0;
+      let restarting = false;
+      const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        if (url.pathname === "/api/router/top-up/5") {
+          if (!request.headers.has("payment-signature")) return topupRequired(5);
+          paid++;
+          return topupAccepted(5);
+        }
+        if (url.pathname === "/api/agents/self/router-balance-key") {
+          if (restarting && failure === "console")
+            return new Response("private-console-error", { status: 503 });
+          return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+        }
+        if (url.pathname === "/api/agents/self/router")
+          return Response.json({
+            ...usageResponse(),
+            balance: { purchasedUsd: 0, spentUsd: 0, remainingUsd: 0 },
+          });
+        if (url.host === "router.example")
+          return new Response(
+            request.headers.get("authorization") === `Bearer ${ROUTER_KEY}`
+              ? "Budget has been exceeded"
+              : "private-chat-error",
+            { status: request.headers.get("authorization") === `Bearer ${ROUTER_KEY}` ? 429 : 503 },
+          );
+        throw new Error(`Unexpected URL ${url}`);
+      });
+      const deps = await linkedDeps(fetchImpl, { routerRefill: { belowUsd: 1, tierUsd: 5 } });
+      const set = deps.secrets.set.bind(deps.secrets);
+      vi.spyOn(deps.secrets, "set").mockImplementation(async (name, value) => {
+        if (
+          name === agentSecretAccounts("main").routerBalance &&
+          (!restarting || failure === "key")
+        )
+          throw new Error("private-key-error");
+        await set(name, value);
+      });
+      const purchase = await buyRouterBalance({ ...deps, ...refillOptions(deps.wallets) }, 5);
+      restarting = true;
+      const wallets = await WalletStore.open(deps.wallets.home);
+      const account = vi.fn(async () => privateKeyToAccount(PRIVATE_KEY));
+      const error = await routerChat(
+        { ...deps, wallets, refill: { ...refillOptions(wallets), account } },
+        { model: "model", messages: [] },
+      ).catch((error: unknown) => error);
+      expect(error).toMatchObject({
+        code: "refill_pending",
+        refill: { receipt: { id: purchase.receipt.id, settlement: { outcome: "succeeded" } } },
+      });
+      expect((error as Error).message).toContain("Payment settled");
+      expect((error as Error).message).not.toMatch(/buy|pay again/i);
+      expect(JSON.stringify(error)).not.toContain("private-");
+      expect(paid).toBe(1);
+      expect(account).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["console", "credentials", "chat-http", "chat-budget", "chat-key"] as const)(
+    "retains the FIRST settled refill across later %s failure and recovers without paying again",
+    async (failure) => {
+      let paid = 0;
+      let failLater = true;
+      const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+        if (url.host === "router.example") {
+          if (headers.get("authorization") === `Bearer ${ROUTER_KEY}`)
+            return new Response("Budget has been exceeded", { status: 429 });
+          expect(headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+          if (failLater && failure.startsWith("chat-"))
+            return new Response(
+              failure === "chat-budget" ? "Budget has been exceeded" : "unavailable",
+              {
+                status: failure === "chat-budget" ? 429 : failure === "chat-key" ? 401 : 503,
+              },
+            );
+          return Response.json({ choices: [{ message: { content: "chat recovered" } }] });
+        }
+        if (url.pathname === "/api/router/top-up/1") {
+          if (!headers.has("payment-signature")) return topupRequired(1);
+          paid++;
+          return topupAccepted(1);
+        }
+        if (paid > 0 && failLater && failure === "console")
+          throw new Error("private-console-error-must-not-leak");
+        if (url.pathname === "/api/agents/self/router-balance-key")
+          return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+        if (url.pathname === "/api/agents/self/router")
+          return Response.json({
+            ...usageResponse(),
+            balance: { purchasedUsd: paid, spentUsd: 0, remainingUsd: paid },
+          });
+        throw new Error(`Unexpected test URL ${url}`);
+      });
+      const deps = await linkedDeps(fetchImpl, { routerRefill: { belowUsd: 1, tierUsd: 1 } });
+      const balanceAccount = agentSecretAccounts("main").routerBalance;
+      expect(deps.secrets.entries[balanceAccount]).toBeUndefined();
+      const originalGet = deps.secrets.get;
+      deps.secrets.get = async (name) => {
+        if (
+          failure === "credentials" &&
+          failLater &&
+          name === balanceAccount &&
+          deps.secrets.entries[name]
+        )
+          throw new Error("private-keystore-error-must-not-leak");
+        return await originalGet(name);
+      };
+      const options = { ...deps, refill: refillOptions(deps.wallets) };
+      const error = await routerChat(options, { model: "model", messages: [] }).catch(
+        (error: unknown) => error,
+      );
+      expect(error).toBeInstanceOf(RouterClientError);
+      expect(error).toMatchObject({
+        code: "refill_pending",
+        refill: { receipt: { outcome: "paid", settlement: { outcome: "succeeded" } } },
+      });
+      expect((error as Error).message).toContain("Payment settled");
+      expect((error as Error).message).not.toMatch(/buy|top-up/i);
+      expect(JSON.stringify(error)).not.toContain("private-");
+      if (failure === "console") {
+        expect((error as Error).message).toContain("key is not yet available");
+        expect((error as Error).message).toContain("next request");
+        expect(error).toMatchObject({
+          refill: {
+            balance: null,
+            warnings: [{ code: "router_key_unavailable" }, { code: "balance_unavailable" }],
+          },
+        });
+      }
+      expect(paid).toBe(1);
+      failLater = false;
+      await expect(
+        routerChat(
+          { ...deps, refill: refillOptions(deps.wallets) },
+          { model: "model", messages: [] },
+        ),
+      ).resolves.toMatchObject({
+        content: "chat recovered",
+        keyUsed: "balance",
+      });
+      expect(deps.secrets.entries[balanceAccount]).toBe(BALANCE_KEY);
+      expect(paid).toBe(1);
+    },
+  );
+
+  it("continues chat and returns the paid refill warning when post-payment usage is unavailable", async () => {
+    let chats = 0;
+    let usageCalls = 0;
+    let paid = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+      if (url.host === "router.example") {
+        if (++chats === 1) return new Response("Budget has been exceeded", { status: 429 });
+        expect(headers.get("authorization")).toBe(`Bearer ${BALANCE_KEY}`);
+        return Response.json({ choices: [{ message: { content: "paid chat continues" } }] });
+      }
+      if (url.pathname === "/api/agents/self/router") {
+        if (++usageCalls > 2) return new Response("unavailable", { status: 503 });
+        return Response.json({
+          ...usageResponse(),
+          balance: { purchasedUsd: 0, spentUsd: 0, remainingUsd: 0 },
+        });
+      }
+      if (url.pathname === "/api/router/top-up/1") {
+        if (!headers.has("payment-signature")) return topupRequired(1);
+        paid++;
+        return topupAccepted(1);
+      }
+      throw new Error(`Unexpected test URL ${url}`);
+    });
+    const deps = await linkedDeps(fetchImpl, {
+      balanceKey: BALANCE_KEY,
+      routerRefill: { belowUsd: 1, tierUsd: 1 },
+    });
+    const result = await routerChat(
+      { ...deps, refill: refillOptions(deps.wallets) },
+      { model: "model", messages: [] },
+    );
+    expect(result).toMatchObject({
+      content: "paid chat continues",
+      keyUsed: "balance",
+      refill: {
+        receipt: { outcome: "paid" },
+        balance: null,
+        warnings: [{ code: "balance_unavailable" }],
+      },
+    });
+    expect(paid).toBe(1);
+  });
+
   it("sends the stake key only to the Router and passes tool fields through", async () => {
     const calls: Array<{ url: URL; init?: RequestInit }> = [];
     const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
@@ -594,6 +971,9 @@ describe("routerChat", () => {
     });
 
     expect(runBudget.spentAtomic()).toBe(0n);
+    expect((await WalletStore.open(deps.wallets.home)).entry("main")).not.toHaveProperty(
+      "routerPendingPurchase",
+    );
     await expect(readAuditLog(deps.wallets.home)).resolves.toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -1008,15 +1388,16 @@ describe("buyRouterBalance", () => {
           router_base_url: "https://other-router.example",
         });
       }
+      if (url.pathname === "/api/agents/self/router") return Response.json(usageResponse());
       throw new Error(`Unexpected test URL ${url.origin}${url.pathname}`);
     });
     const deps = await linkedDeps(fetchImpl);
 
     await expect(
       buyRouterBalance({ ...deps, ...refillOptions(deps.wallets) }, 1),
-    ).rejects.toMatchObject({
-      code: "http",
-      message: expect.stringMatching(/payment went through.*next chat\/buy/iu),
+    ).resolves.toMatchObject({
+      receipt: { outcome: "paid" },
+      warnings: [{ code: "router_key_unavailable" }],
     });
     expect(deps.secrets.entries[agentSecretAccounts("main").routerBalance]).toBeUndefined();
     expect(await readFile(join(deps.wallets.home, "receipts.jsonl"), "utf8")).toContain(
@@ -1058,6 +1439,521 @@ describe("buyRouterBalance", () => {
     expect(balanceKeyCalls).toBe(2);
     expect(deps.secrets.entries[agentSecretAccounts("main").routerBalance]).toBe(BALANCE_KEY);
   });
+});
+
+describe("Router purchase state resolution", () => {
+  function pending(status: "prepared" | "signed" = "signed") {
+    return {
+      receiptId: "crashed-purchase",
+      status,
+      createdAt: NOW.toISOString(),
+      tierUsd: 5 as const,
+      link: agentLink(),
+      network: BASE_MAINNET_CAIP2,
+      amountAtomic: "5000000",
+      ...(status === "prepared"
+        ? {}
+        : {
+            authorization: {
+              token: NETWORKS[BASE_MAINNET_CAIP2].usdc,
+              from: privateKeyToAccount(PRIVATE_KEY).address,
+              nonce: `0x${"ab".repeat(32)}` as Hex,
+              validBefore: String(Math.floor(NOW.getTime() / 1000) - 120),
+            },
+          }),
+    };
+  }
+
+  it("clears a crash after prepared with no receipt on the next run", async () => {
+    const deps = await linkedDeps(vi.fn());
+    await deps.wallets.setRouterPendingPurchase("main", pending("prepared"));
+    const transport = purchaseTransport(deps.wallets.home, "key-store", ROUTER_BASE);
+    const wallets = await WalletStore.open(deps.wallets.home);
+    await expect(
+      buyRouterBalance(
+        { ...deps, wallets, ...refillOptions(wallets), fetchImpl: transport.fetchImpl },
+        5,
+      ),
+    ).resolves.toMatchObject({ receipt: { settlement: { outcome: "succeeded" } } });
+    expect(transport.calls.paid).toBe(1);
+  });
+
+  it.each([false, true, "rpc-error", "unexpired", "margin"] as const)(
+    "resolves signed authorization state %s without guessing from age",
+    async (state) => {
+      const deps = await linkedDeps(vi.fn());
+      const record = pending();
+      if (state === "unexpired" || state === "margin")
+        record.authorization!.validBefore = String(
+          Math.floor(NOW.getTime() / 1000) + (state === "margin" ? -5 : 120),
+        );
+      await deps.wallets.setRouterPendingPurchase("main", record);
+      const transport = purchaseTransport(deps.wallets.home, "key-store", ROUTER_BASE);
+      let rpcCalls = 0;
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        if (
+          new URL(request.url).origin ===
+          new URL(getDefaultConfig().networks[BASE_MAINNET_CAIP2]!.rpcUrl).origin
+        ) {
+          rpcCalls++;
+          const body = (await request.json()) as {
+            id: number;
+            method: string;
+            params: [{ to: string; data: string }];
+          };
+          expect(body.method).toBe("eth_call");
+          expect(body.params[0].to.toLowerCase()).toBe(record.authorization!.token.toLowerCase());
+          expect(body.params[0].data).toContain(record.authorization!.nonce.slice(2));
+          if (state === "rpc-error") throw new Error("RPC offline");
+          return Response.json({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: `0x${(state === true ? "1" : "0").padStart(64, "0")}`,
+          });
+        }
+        return transport.fetchImpl(input, init);
+      };
+      const operation = buyRouterBalance({ ...deps, ...refillOptions(deps.wallets), fetchImpl }, 5);
+      if (state === "rpc-error" || state === "unexpired" || state === "margin") {
+        await expect(operation).rejects.toMatchObject({
+          code: "refill_pending",
+          message: expect.stringContaining(
+            state === "rpc-error" ? "vapi router clear-pending --confirm-unpaid" : "2026-09-23T10:",
+          ),
+        });
+        expect(transport.calls.paid).toBe(0);
+      } else {
+        const result = await operation;
+        expect(result.receipt.settlement?.outcome).toBe("succeeded");
+        expect(transport.calls.paid).toBe(state === true ? 0 : 1);
+        if (state === true) expect(result.receipt.id).toBe(record.receiptId);
+      }
+      expect(rpcCalls).toBeGreaterThan(0);
+    },
+  );
+
+  it("keeps the guard after an old-schema registry rewrite", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const record = pending("prepared");
+    await deps.wallets.setRouterPendingPurchase("main", record);
+    const registry = JSON.parse(await readFile(join(deps.wallets.home, "wallets.json"), "utf8"));
+    delete registry.wallets.main.routerPendingPurchase;
+    await writeFile(join(deps.wallets.home, "wallets.json"), JSON.stringify(registry));
+    const wallets = await WalletStore.open(deps.wallets.home);
+    expect(wallets.entry("main")?.routerPendingPurchase).toEqual(record);
+    expect(await readFile(join(wallets.home, "router-pending", "main.json"), "utf8")).toContain(
+      record.receiptId,
+    );
+  });
+
+  it.each(["prepared", "settled"] as const)(
+    "migrates legacy registry %s evidence without resurrecting it after clear",
+    async (status) => {
+      const deps = await linkedDeps(vi.fn());
+      const registryPath = join(deps.wallets.home, "wallets.json");
+      const registry = JSON.parse(await readFile(registryPath, "utf8"));
+      const record = { ...pending("prepared"), status };
+      registry.wallets.main.routerPendingPurchase = record;
+      await writeFile(registryPath, JSON.stringify(registry));
+      const migrated = await WalletStore.open(deps.wallets.home);
+      expect(migrated.entry("main")?.routerPendingPurchase).toMatchObject({
+        receiptId: record.receiptId,
+        status: status === "prepared" ? "unknown" : "settled",
+      });
+      expect(await readFile(join(migrated.home, "router-pending", "main.json"), "utf8")).toContain(
+        record.receiptId,
+      );
+      await migrated.setRouterPendingPurchase("main", null, record.receiptId);
+      // Simulate an older process rewriting its stale registry snapshot.
+      await writeFile(registryPath, JSON.stringify(registry));
+      expect(
+        (await WalletStore.open(deps.wallets.home)).entry("main")?.routerPendingPurchase,
+      ).toBeUndefined();
+    },
+  );
+
+  it("keeps unsupported authorization recovery blocked with human guidance", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const deps = await linkedDeps(fetchImpl);
+    await deps.wallets.setRouterPendingPurchase("main", { ...pending(), network: "eip155:999999" });
+    await expect(
+      buyRouterBalance({ ...deps, ...refillOptions(deps.wallets) }, 5),
+    ).rejects.toMatchObject({
+      code: "refill_pending",
+      message: expect.stringContaining("vapi router clear-pending --confirm-unpaid"),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("releases a reservation when the allowance already expired before payment", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const transport = purchaseTransport(deps.wallets.home, "key-store", ROUTER_BASE);
+    await expect(
+      buyRouterBalance(
+        {
+          ...deps,
+          ...refillOptions(deps.wallets),
+          fetchImpl: transport.fetchImpl,
+          allowanceExpiresAt: new Date(NOW.getTime() - 1),
+        },
+        5,
+      ),
+    ).rejects.toThrow(/allowance expired/iu);
+    expect(
+      (await WalletStore.open(deps.wallets.home)).entry("main")?.routerPendingPurchase,
+    ).toBeUndefined();
+    expect(transport.calls.paid).toBe(0);
+  });
+
+  it("does not sign if journaling the signed transition fails", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const account = privateKeyToAccount(PRIVATE_KEY);
+    const sign = vi.spyOn(account, "signTypedData");
+    const original = deps.wallets.setRouterPendingPurchase.bind(deps.wallets);
+    vi.spyOn(deps.wallets, "setRouterPendingPurchase").mockImplementation(
+      async (name, record, expected) => {
+        if (record?.status === "signed") throw new Error("signing journal unavailable");
+        return original(name, record, expected);
+      },
+    );
+    const transport = purchaseTransport(deps.wallets.home, "key-store", ROUTER_BASE);
+    await expect(
+      buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), account, fetchImpl: transport.fetchImpl },
+        5,
+      ),
+    ).rejects.toThrow("signing journal unavailable");
+    expect(sign).not.toHaveBeenCalled();
+    expect(transport.calls.paid).toBe(0);
+  });
+
+  it("rechecks the balance under reservation before auto-refilling", async () => {
+    let usageCalls = 0;
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/v1/chat/completions"))
+        return request.headers.get("authorization") === `Bearer ${ROUTER_KEY}`
+          ? new Response("budget exceeded", { status: 402 })
+          : Response.json({ choices: [{ message: { content: "existing balance" } }] });
+      if (url.pathname === "/api/agents/self/router")
+        return Response.json({
+          ...usageResponse(),
+          balance: ++usageCalls === 1 ? null : usageResponse().balance,
+        });
+      throw new Error(`Unexpected URL ${url}`);
+    });
+    const deps = await linkedDeps(fetchImpl, {
+      routerRefill: { belowUsd: 1, tierUsd: 5 },
+      balanceKey: BALANCE_KEY,
+    });
+    await expect(
+      routerChat(
+        { ...deps, refill: refillOptions(deps.wallets) },
+        { model: "model", messages: [] },
+      ),
+    ).resolves.toMatchObject({ content: "existing balance" });
+    expect(
+      fetchImpl.mock.calls.some(([input]) =>
+        String(input instanceof Request ? input.url : input).includes("top-up"),
+      ),
+    ).toBe(false);
+    expect(
+      (await WalletStore.open(deps.wallets.home)).entry("main")?.routerPendingPurchase,
+    ).toBeUndefined();
+  });
+
+  it("journals public authorization evidence before the signer runs", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const account = privateKeyToAccount(PRIVATE_KEY);
+    const sign = vi.spyOn(account, "signTypedData").mockImplementation(async () => {
+      const wallets = await WalletStore.open(deps.wallets.home);
+      expect(wallets.entry("main")?.routerPendingPurchase).toMatchObject({
+        status: "signed",
+        network: BASE_MAINNET_CAIP2,
+        authorization: {
+          from: account.address,
+          token: NETWORKS[BASE_MAINNET_CAIP2].usdc,
+          nonce: expect.any(String),
+          validBefore: expect.any(String),
+        },
+      });
+      throw new Error("crash at signing");
+    });
+    const transport = purchaseTransport(deps.wallets.home, "key-store", ROUTER_BASE);
+    await expect(
+      buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), account, fetchImpl: transport.fetchImpl },
+        5,
+      ),
+    ).rejects.toThrow("crash at signing");
+    expect(sign).toHaveBeenCalledOnce();
+    expect(transport.calls.paid).toBe(0);
+    const record = await readFile(join(deps.wallets.home, "router-pending", "main.json"), "utf8");
+    expect(record).not.toContain("signature");
+    expect(record).not.toContain(PRIVATE_KEY);
+  });
+
+  it.each([1, 10])(
+    "two clients with stale low balance and a successful first purchase buy once (threshold %s)",
+    async (belowUsd) => {
+      let paid = 0;
+      let decisions = 0;
+      let bothDecided!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        bothDecided = resolve;
+      });
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        if (
+          url.pathname === "/gateway//v1/chat/completions" ||
+          url.pathname.endsWith("/v1/chat/completions")
+        ) {
+          return request.headers.get("authorization") === `Bearer ${ROUTER_KEY}`
+            ? new Response("budget exceeded", { status: 402 })
+            : Response.json({ choices: [{ message: { content: "ok" } }] });
+        }
+        if (url.pathname === "/api/agents/self/router") {
+          if (decisions++ < 2) {
+            if (decisions === 2) bothDecided();
+            await barrier;
+            return Response.json({ ...usageResponse(), balance: null });
+          }
+          return Response.json({
+            ...usageResponse(),
+            balance: paid === 0 ? null : { purchasedUsd: 5, spentUsd: 0, remainingUsd: 5 },
+          });
+        }
+        if (url.pathname === "/api/router/top-up/5") {
+          if (!request.headers.has("payment-signature")) return topupRequired();
+          paid++;
+          return topupAccepted();
+        }
+        if (url.pathname === "/api/agents/self/router-balance-key")
+          return Response.json({ router_key: BALANCE_KEY, router_base_url: ROUTER_BASE });
+        const body = (await request.json()) as { id: number };
+        return Response.json({ jsonrpc: "2.0", id: body.id, result: `0x${"0".repeat(64)}` });
+      };
+      const deps = await linkedDeps(fetchImpl, { routerRefill: { belowUsd, tierUsd: 5 } });
+      const other = await WalletStore.open(deps.wallets.home);
+      const results = await Promise.all([
+        routerChat(
+          { ...deps, refill: refillOptions(deps.wallets) },
+          { model: "model", messages: [] },
+        ),
+        routerChat(
+          { ...deps, wallets: other, refill: refillOptions(other) },
+          { model: "model", messages: [] },
+        ),
+      ]);
+      expect(results.map((result) => result.content)).toEqual(["ok", "ok"]);
+      expect(paid).toBe(1);
+    },
+  );
+});
+
+describe("confirmed Router purchases", () => {
+  it("keeps settled evidence if completion is interrupted before clearing and the ledger is unavailable", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const transport = purchaseTransport(deps.wallets.home, "receipt", ROUTER_BASE);
+    const original = deps.wallets.setRouterPendingPurchase.bind(deps.wallets);
+    vi.spyOn(deps.wallets, "setRouterPendingPurchase").mockImplementation(
+      async (name, pending, expected) => {
+        if (pending === null) throw new Error("crash before clearing");
+        return original(name, pending, expected);
+      },
+    );
+    const result = await buyRouterBalance(
+      { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+      5,
+    );
+    const restarted = await WalletStore.open(deps.wallets.home);
+    expect(restarted.entry("main")?.routerPendingPurchase).toMatchObject({
+      status: "settled",
+      receiptId: result.receipt.id,
+      network: BASE_MAINNET_CAIP2,
+      amountAtomic: "4750000",
+      transaction: result.receipt.settlement!.transaction,
+    });
+  });
+
+  it("recovers the original paid evidence after restart when the receipt ledger was unwritable", async () => {
+    const deps = await linkedDeps(vi.fn(), { routerRefill: { belowUsd: 10, tierUsd: 5 } });
+    const transport = purchaseTransport(deps.wallets.home, "receipt", ROUTER_BASE);
+    const set = deps.secrets.set.bind(deps.secrets);
+    const keyFailure = vi.spyOn(deps.secrets, "set").mockImplementation(async (name, value) => {
+      if (name === agentSecretAccounts("main").routerBalance) throw new Error("private-key-error");
+      await set(name, value);
+    });
+    const purchase = await buyRouterBalance(
+      { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+      5,
+    );
+    expect(purchase.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "receipt_unavailable" }),
+        expect.objectContaining({ code: "router_key_unavailable" }),
+      ]),
+    );
+    keyFailure.mockRestore();
+    const wallets = await WalletStore.open(deps.wallets.home);
+    const account = vi.fn(async () => privateKeyToAccount(PRIVATE_KEY));
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (new URL(request.url).host === "router.example") {
+        expect(request.headers.get("authorization")).toBe("Bearer test-balance-key");
+        return Response.json({ choices: [{ message: { content: "recovered" } }] });
+      }
+      return await transport.fetchImpl(input, init);
+    };
+    await expect(
+      routerChat(
+        { ...deps, wallets, fetchImpl, refill: { ...refillOptions(wallets), account } },
+        { model: "model", messages: [] },
+      ),
+    ).resolves.toMatchObject({
+      content: "recovered",
+      refill: {
+        receipt: {
+          id: purchase.receipt.id,
+          timestamp: purchase.receipt.timestamp,
+          quote: { network: BASE_MAINNET_CAIP2, amountAtomic: "4750000" },
+          settlement: {
+            outcome: "succeeded",
+            transaction: purchase.receipt.settlement!.transaction,
+          },
+        },
+      },
+    });
+    expect(transport.calls.paid).toBe(1);
+    expect(account).not.toHaveBeenCalled();
+    expect((await WalletStore.open(wallets.home)).entry("main")).not.toHaveProperty(
+      "routerPendingPurchase",
+    );
+  });
+
+  it("does not pay when the durable reservation cannot be written", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const transport = purchaseTransport(deps.wallets.home, "key", ROUTER_BASE);
+    Object.assign(deps.wallets, {
+      setRouterPendingPurchase: async () => {
+        throw new Error("pending storage unavailable");
+      },
+    });
+    await expect(
+      buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+        5,
+      ),
+    ).rejects.toBeDefined();
+    expect(transport.calls.paid).toBe(0);
+  });
+
+  it("serializes unresolved purchase ownership across independent wallet clients", async () => {
+    const deps = await linkedDeps(vi.fn());
+    const transport = purchaseTransport(deps.wallets.home, "key", ROUTER_BASE);
+    const other = await WalletStore.open(deps.wallets.home);
+    const results = await Promise.allSettled([
+      buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+        5,
+      ),
+      buyRouterBalance(
+        { ...deps, wallets: other, ...refillOptions(other), fetchImpl: transport.fetchImpl },
+        5,
+      ),
+    ]);
+    expect(transport.calls.paid).toBe(1);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.find((result) => result.status === "rejected")).toMatchObject({
+      reason: { code: "refill_pending" },
+    });
+  });
+
+  it.each(["receipt", "key-store"] as const)(
+    "returns the confirmed receipt when %s persistence fails",
+    async (failure) => {
+      const deps = await linkedDeps(vi.fn());
+      const transport = purchaseTransport(deps.wallets.home, failure, ROUTER_BASE);
+      if (failure === "key-store") {
+        const set = deps.secrets.set.bind(deps.secrets);
+        vi.spyOn(deps.secrets, "set").mockImplementation(async (account, value) => {
+          if (account === agentSecretAccounts("main").routerBalance)
+            throw new Error("private-store-error-must-not-leak");
+          await set(account, value);
+        });
+      }
+      const result = await buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl: transport.fetchImpl },
+        5,
+      );
+      expect(transport.calls.paid).toBe(1);
+      expect(result.receipt).toMatchObject({
+        outcome: "paid",
+        settlement: { outcome: "succeeded" },
+      });
+      expect(result.warnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: failure === "receipt" ? "receipt_unavailable" : "router_key_unavailable",
+          }),
+        ]),
+      );
+      expect(JSON.stringify(result)).not.toContain("private-store-error-must-not-leak");
+    },
+  );
+
+  it.each(["audit", "key", "balance", "all", "response"] as const)(
+    "returns the paid receipt when %s follow-up fails",
+    async (failure) => {
+      const deps = await linkedDeps(vi.fn());
+      const { fetchImpl, calls } = purchaseTransport(deps.wallets.home, failure, ROUTER_BASE);
+      const result = await buyRouterBalance(
+        { ...deps, ...refillOptions(deps.wallets), fetchImpl },
+        5,
+      );
+      expect(calls.paid).toBe(1);
+      expect(result.receipt).toMatchObject({
+        outcome: "paid",
+        settlement: { outcome: "succeeded" },
+        quote: { amountAtomic: "4750000" },
+      });
+      expect(result).toMatchObject({
+        warnings:
+          failure === "all"
+            ? [
+                { code: "audit_unavailable" },
+                { code: "router_key_unavailable" },
+                { code: "balance_unavailable" },
+              ]
+            : [
+                {
+                  code:
+                    failure === "response"
+                      ? "purchase_response_unavailable"
+                      : failure === "audit"
+                        ? "audit_unavailable"
+                        : failure === "key"
+                          ? "router_key_unavailable"
+                          : "balance_unavailable",
+                },
+              ],
+      });
+      expect(calls.key).toBe(1);
+      expect(calls.balance).toBe(1);
+      expect(result.balance).toEqual(
+        failure === "balance" || failure === "all"
+          ? null
+          : { purchasedUsd: 5, spentUsd: 0, remainingUsd: 5 },
+      );
+      expect((await readReceipts(join(deps.wallets.home, "receipts.jsonl")))[0]?.id).toBe(
+        result.receipt.id,
+      );
+      expect(JSON.stringify(result)).not.toContain("private-follow-up-error-must-not-leak");
+    },
+  );
 });
 
 describe("console Router endpoints", () => {

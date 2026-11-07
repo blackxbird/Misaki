@@ -7,7 +7,8 @@ import { getVapiPaths } from "./config.js";
 import type { VapiPaymentAccount } from "./keystore.js";
 import { assertPublicUrl, createPublicFetch, type LookupFn } from "./net-guard.js";
 import { areSamePaymentNetwork, explorerTransactionUrl, formatUsdc } from "./networks.js";
-import { appendReceipt, type Receipt } from "./receipts.js";
+import { appendReceipt, parseReceipt, type Receipt } from "./receipts.js";
+import type { PaymentWarning } from "./payment-warning.js";
 import { RunBudgetError, type RunBudget } from "./run-budget.js";
 import { SpendCapExceededError } from "./spend-cap-exceeded.js";
 import { releaseSpend, reserveSpend, SpendCapError } from "./spend-policy.js";
@@ -25,6 +26,7 @@ import {
   X402Error,
   type X402NetworkConfig,
   type X402Quote,
+  type X402SigningEvidence,
   type X402SettlementOutcome,
 } from "./x402.js";
 
@@ -40,8 +42,12 @@ export type PayRequestArgs = {
   maxAtomic?: bigint;
   preferNetworks?: string[];
   paymentId?: string;
+  /** Caller-allocated journal id, persisted before paying when recovery requires it. */
+  receiptId?: string;
   now?: Date;
   allowanceExpiresAt?: Date;
+  /** Must finish durable journaling before the signer is invoked. */
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
   nowMs?: () => number;
   source?: string;
   lookup?: LookupFn;
@@ -51,7 +57,11 @@ export type PayRequestArgs = {
   run?: RunRef;
 };
 
-export type PayRequestResult = { response: Response; receipt: Receipt };
+export type PayRequestResult = {
+  response: Response;
+  receipt: Receipt;
+  warnings?: PaymentWarning[];
+};
 
 export type X402PaymentAttempt = {
   response: Response;
@@ -127,6 +137,8 @@ export type CompleteX402PaymentArgs<T = undefined> = {
   paymentId?: string;
   now?: Date;
   allowanceExpiresAt?: Date;
+  /** Must finish durable journaling before the signer is invoked. */
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
   nowMs?: () => number;
   quoteStartedMs?: number;
   trace?: X402PaymentTrace;
@@ -153,22 +165,40 @@ export type CompleteX402PaymentResult<T = undefined> = {
  * quote, payer, authorization, or settlement fields. The existing receipt
  * vocabulary records a successful unpaid response as `paid`.
  */
-export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult> {
+export async function payRequest(input: PayRequestArgs): Promise<PayRequestResult> {
+  // Snapshot caller-controlled metadata before any asynchronous payment work.
+  const args: PayRequestArgs = {
+    ...input,
+    ...(input.run === undefined ? {} : { run: { ...input.run } }),
+    ...(input.now === undefined ? {} : { now: new Date(input.now.getTime()) }),
+  };
   const startedAt = args.now ?? new Date();
   assertAllowanceCurrent(startedAt, args.allowanceExpiresAt);
   const nowMs = args.nowMs ?? (() => performance.now());
   const startedMs = nowMs();
-  const receiptId = randomUUID();
+  const receiptId = args.receiptId ?? randomUUID();
   const trace: X402PaymentTrace = { phases: {}, capsApplied: false };
   const defaults = getVapiPaths();
   const ledgerPath = args.paths?.ledgerPath ?? defaults.ledger;
   const receiptsPath = args.paths?.receiptsPath ?? defaults.receipts;
   const request = new Request(args.url, { ...args.init, redirect: "manual" });
+  parseReceipt({
+    id: receiptId,
+    timestamp: startedAt.toISOString(),
+    resourceUrl: request.url,
+    method: request.method,
+    wallet: args.wallet,
+    source: args.source ?? "direct",
+    ...(args.run === undefined ? {} : { run: args.run }),
+  });
   const fetchImpl = guardedFetch(args.fetchImpl, {
     allowPrivateNetwork: args.config.allowPrivateNetwork ?? false,
     lookup: args.lookup,
   });
   let response: Response | undefined;
+  let paidResponse: Response | undefined;
+  let paidRequest: Request | undefined;
+  const warnings: PaymentWarning[] = [];
   let receiptRequest = request;
   let outcome: NonNullable<Receipt["outcome"]>;
 
@@ -183,11 +213,10 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
         account: args.account,
         caps: args.caps,
         config: args.config,
-        send: async (paidRequest) => {
-          const paidResponse = await fetchImpl(
-            new Request(paidRequest.clone(), { redirect: "manual" }),
-          );
-          return directAttempt(paidResponse, paidRequest);
+        send: async (requestToPay) => {
+          paidRequest = requestToPay;
+          paidResponse = await fetchImpl(new Request(requestToPay.clone(), { redirect: "manual" }));
+          return directAttempt(paidResponse, requestToPay);
         },
         fetchImpl,
         ledgerPath,
@@ -201,6 +230,7 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
           : { allowanceExpiresAt: args.allowanceExpiresAt }),
         nowMs,
         trace,
+        ...(args.beforeSign === undefined ? {} : { beforeSign: args.beforeSign }),
         ...(args.runBudget === undefined ? {} : { runBudget: args.runBudget }),
         ...(args.ceilingSweep === undefined ? {} : { ceilingSweep: args.ceilingSweep }),
       });
@@ -209,31 +239,67 @@ export async function payRequest(args: PayRequestArgs): Promise<PayRequestResult
       outcome = completed.settlementOutcome === "succeeded" ? "paid" : "settlement_unknown";
     }
   } catch (error) {
-    const safeError = sanitizeThrownError(error, requestSecretValues(request.headers));
-    const errorReceipt = directReceipt(
-      args,
-      request,
-      trace,
-      receiptId,
-      startedAt,
-      elapsed(nowMs, startedMs),
-      {
-        outcome: paymentErrorOutcome(safeError),
-        error: { code: errorCode(safeError), message: receiptSafeErrorMessage(safeError) },
-      },
-    );
-    await appendReceipt(errorReceipt, receiptsPath, { wallet: args.wallet }).catch(() => undefined);
-    throw safeError;
+    if (trace.settlement?.outcome === "succeeded" && paidResponse !== undefined) {
+      response = paidResponse;
+      receiptRequest = paidRequest ?? request;
+      outcome = "paid";
+      warnings.push({
+        code: "payment_followup_unavailable",
+        message:
+          "Payment settled, but post-payment processing failed. Keep the returned receipt; do not repeat the payment.",
+      });
+    } else {
+      const safeError = sanitizeThrownError(error, requestSecretValues(request.headers));
+      const errorReceipt = directReceipt(
+        args,
+        request,
+        trace,
+        receiptId,
+        startedAt,
+        safeElapsed(nowMs, startedMs),
+        {
+          outcome: paymentErrorOutcome(safeError),
+          error: { code: errorCode(safeError), message: receiptSafeErrorMessage(safeError) },
+        },
+      );
+      await appendReceipt(errorReceipt, receiptsPath, { wallet: args.wallet }).catch(
+        () => undefined,
+      );
+      throw safeError;
+    }
   }
 
-  const receipt = await appendReceipt(
-    directReceipt(args, receiptRequest, trace, receiptId, startedAt, elapsed(nowMs, startedMs), {
-      outcome,
-    }),
-    receiptsPath,
-    { wallet: args.wallet },
-  );
-  return { response, receipt };
+  let latencyMs: number;
+  try {
+    latencyMs = elapsed(nowMs, startedMs);
+  } catch (error) {
+    if (trace.settlement?.outcome !== "succeeded") throw error;
+    latencyMs = 0;
+    if (!warnings.some((warning) => warning.code === "payment_followup_unavailable")) {
+      warnings.push({
+        code: "payment_followup_unavailable",
+        message:
+          "Payment settled, but timing metadata is unavailable. Keep the returned receipt; do not repeat the payment.",
+      });
+    }
+  }
+  let receipt = directReceipt(args, receiptRequest, trace, receiptId, startedAt, latencyMs, {
+    outcome,
+  });
+  try {
+    receipt = await appendReceipt(receipt, receiptsPath, { wallet: args.wallet });
+  } catch (error) {
+    if (trace.settlement?.outcome !== "succeeded") throw error;
+    // Never validate the same rejected receipt a second time after settlement.
+    // The financial evidence and prevalidated metadata remain available in memory.
+    receipt = { ...receipt, wallet: args.wallet };
+    warnings.push({
+      code: "receipt_unavailable",
+      message:
+        "Payment settled, but its receipt could not be saved locally. Save the returned receipt; do not repeat the payment.",
+    });
+  }
+  return { response, receipt, ...(warnings.length === 0 ? {} : { warnings }) };
 }
 
 /**
@@ -343,6 +409,7 @@ export async function completeX402Payment<T = undefined>(
     payment = await buildCompatibleX402Payment({
       account: args.account,
       quote,
+      ...(args.beforeSign === undefined ? {} : { beforeSign: args.beforeSign }),
       fetchImpl:
         args.fetchImpl ??
         createPublicFetch({
@@ -405,7 +472,7 @@ export async function completeX402Payment<T = undefined>(
   try {
     paidAttempt = await args.send(paidRequest, quote);
   } catch (error) {
-    if (trace) trace.phases.requestMs = elapsed(nowMs, requestStarted);
+    if (trace) trace.phases.requestMs = safeElapsed(nowMs, requestStarted);
     throw settlementUnknown(
       "The paid request lost its response. Do not retry automatically; inspect the authorization and settlement state first.",
       quote,
@@ -415,12 +482,12 @@ export async function completeX402Payment<T = undefined>(
       sanitizeThrownError(error, receiptSecrets),
     );
   }
-  if (trace) trace.phases.requestMs = elapsed(nowMs, requestStarted);
 
   const paidResponse = paidAttempt.response;
   if (trace) trace.status = paidResponse.status;
-  const settleStarted = nowMs();
+  // Capture financial evidence before reading any caller-controlled timing clock.
   const settlement = parseSettlementResponse(paidResponse.headers);
+  const settleStarted = safeClock(nowMs);
   const settlementOutcome = classifySettlement(settlement);
   const receiptSettlement = sanitizeReturnedValue(settlement, receiptSecrets);
   if (trace) {
@@ -434,7 +501,8 @@ export async function completeX402Payment<T = undefined>(
       ...(explorerUrl ? { explorerUrl } : {}),
       ...(receiptSettlement === null ? {} : { evidence: receiptSettlement }),
     };
-    trace.phases.settleMs = elapsed(nowMs, settleStarted);
+    trace.phases.requestMs = safeElapsed(nowMs, requestStarted);
+    trace.phases.settleMs = safeElapsed(nowMs, settleStarted);
   }
 
   try {
@@ -481,7 +549,7 @@ export async function completeX402Payment<T = undefined>(
 
     let body: T | undefined;
     if (args.consumeResponse) {
-      const bodyStarted = nowMs();
+      const bodyStarted = safeClock(nowMs);
       try {
         body = await args.consumeResponse(paidResponse);
       } catch (error) {
@@ -502,7 +570,7 @@ export async function completeX402Payment<T = undefined>(
         );
       } finally {
         if (trace) {
-          trace.phases.requestMs = (trace.phases.requestMs ?? 0) + elapsed(nowMs, bodyStarted);
+          trace.phases.requestMs = (trace.phases.requestMs ?? 0) + safeElapsed(nowMs, bodyStarted);
         }
       }
       body = sanitizeReturnedValue(body, receiptSecrets) as T;
@@ -1014,6 +1082,24 @@ function settlementTransaction(value: unknown): string | undefined {
 
 function isRedirectStatus(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function safeClock(nowMs: () => number): number {
+  try {
+    const now = nowMs();
+    return Number.isFinite(now) ? now : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function safeElapsed(nowMs: () => number, started: number): number {
+  try {
+    const duration = elapsed(nowMs, started);
+    return Number.isFinite(duration) ? duration : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function elapsed(nowMs: () => number, started: number): number {

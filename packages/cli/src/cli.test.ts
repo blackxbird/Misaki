@@ -1887,7 +1887,11 @@ describe("vapi sweep destinations", () => {
     const home = await initializedHome("vapi-cli-sweep-gas-all-");
     const address = await accountAddress(home);
     delete process.env.ARC_RPC_URL;
-    expect(await runCli(["accounts", "--enable", "arc", "--json"], captureIo().io)).toBe(0);
+    const fetchImpl = zeroBalanceRpc();
+    expect(
+      await runCli(["accounts", "--enable", "arc", "--json"], captureIo().io, { fetchImpl }),
+    ).toBe(0);
+    expect(fetchImpl).toHaveBeenCalled();
     const captured = captureIo();
     const sweepBack = vi.fn<NonNullable<CliDependencies["sweepBack"]>>(
       async ({ account, network }) => {

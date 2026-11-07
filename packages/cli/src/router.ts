@@ -1,7 +1,6 @@
 import {
   SpendCapError,
   SpendCapExceededError,
-  formatUsdc,
   getNetworkDefinition,
   getVapiPaths,
   loadConfig,
@@ -16,6 +15,9 @@ import {
   routerChat,
   routerCredentials,
   routerUsage,
+  routerPurchaseView,
+  routerPendingEvidence,
+  resolveRouterPendingPurchase,
   type RouterClientDeps,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
@@ -61,12 +63,76 @@ export async function routerCommand(
     case "buy":
       await buyCommand(argv.slice(1), json, io, dependencies);
       return;
+    case "clear-pending":
+      await clearPendingCommand(argv.slice(1), json, io, dependencies);
+      return;
     case "key":
       await keyCommand(argv.slice(1), json, io, dependencies);
       return;
     default:
-      throw new UsageError("Usage: vapi router <models|usage|chat|key|buy>.");
+      throw new UsageError("Usage: vapi router <models|usage|chat|key|buy|clear-pending>.");
   }
+}
+
+async function clearPendingCommand(
+  argv: string[],
+  json: boolean,
+  io: CliIo,
+  dependencies: CliDependencies,
+): Promise<void> {
+  const parsed = parseArguments(argv, {
+    valueOptions: new Set([WALLET_OPTION]),
+    booleanOptions: new Set(["--confirm-unpaid"]),
+    maximumPositionals: 0,
+  });
+  const target = await targetWallet(parsed, dependencies);
+  await target.store.withRouterPurchaseLock(target.name, async () => {
+    await target.store.refreshRegistry();
+    const pending = target.store.entry(target.name)?.routerPendingPurchase;
+    const evidence = pending === undefined ? null : routerPendingEvidence(pending);
+    const confirmed = parsed.has("--confirm-unpaid");
+    let confirmation: string | undefined;
+    if (confirmed && pending !== undefined) {
+      const resolution = await resolveRouterPendingPurchase(
+        routerDeps(target, dependencies),
+        pending,
+        {
+          ...(dependencies.now === undefined ? {} : { now: dependencies.now() }),
+        },
+      );
+      if (resolution.state === "settled") {
+        throw new Error(
+          "Payment settled; retry chat to recover the key. This purchase cannot be confirmed unpaid.",
+        );
+      }
+      if (resolution.state === "waiting") {
+        throw new Error(
+          `The Router authorization can still settle. Retry after ${resolution.resolvesAt}; this purchase cannot yet be cleared.`,
+        );
+      }
+      if (resolution.state === "unavailable")
+        confirmation = "Human confirmed unpaid without chain evidence.";
+      await target.store.setRouterPendingPurchase(target.name, null, pending.receiptId);
+    }
+    if (json)
+      io.stdout(
+        JSON.stringify({
+          wallet: target.name,
+          pending: evidence,
+          cleared: confirmed && pending !== undefined,
+          ...(confirmation === undefined ? {} : { confirmation }),
+        }),
+      );
+    else if (evidence === null) io.stdout("No pending Router purchase.");
+    else {
+      io.stdout(JSON.stringify(evidence, null, 2));
+      io.stdout(
+        confirmed
+          ? `${confirmation ?? "Verified unpaid."} Cleared the pending Router purchase.`
+          : "After verifying this payment cannot settle, run vapi router clear-pending --confirm-unpaid with the same account.",
+      );
+    }
+  });
 }
 
 async function modelsCommand(
@@ -159,7 +225,7 @@ async function chatCommand(
     ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
   };
   const chat = dependencies.router?.routerChat ?? routerChat;
-  const refill = await refillIfAlreadyUnlocked(target, io, dependencies);
+  const refill = await configuredRefill(target, io, dependencies);
   const result = await withRouterError(() =>
     chat(
       {
@@ -175,11 +241,18 @@ async function chatCommand(
         model: result.model,
         content: result.content,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
+        ...(result.refill === undefined ? {} : { refill: routerPurchaseView(result.refill) }),
       }),
     );
     return;
   }
   io.stdout(result.content ?? "");
+  if (result.refill !== undefined) {
+    io.stderr(`Receipt: ${result.refill.receipt.id}`);
+    if (result.refill.receipt.settlement?.transaction !== undefined)
+      io.stderr(`Transaction: ${result.refill.receipt.settlement.transaction}`);
+  }
+  for (const warning of result.refill?.warnings ?? []) io.stderr(warning.message);
 }
 
 async function buyCommand(
@@ -256,28 +329,26 @@ async function buyCommand(
     throw error;
   }
 
-  const amountAtomic = result.receipt.quote?.amountAtomic ?? String(tierUsd * 1_000_000);
-  const amountUsd = Number(formatUsdc(BigInt(amountAtomic)));
-  const network = result.receipt.quote?.network ?? "eip155:8453";
-  const transaction = result.receipt.settlement?.transaction;
-  const summary = {
-    tierUsd,
-    amountUsd,
-    network,
-    ...(transaction === undefined ? {} : { transaction }),
-    receiptId: result.receipt.id,
-    balance: result.balance,
-  };
+  const summary = { tierUsd, ...routerPurchaseView(result) };
+  const { amountUsd, network } = summary.receipt;
   if (json) {
     io.stdout(JSON.stringify(summary));
     return;
   }
   const networkName = networkDisplayName(network);
+  const payment =
+    amountUsd === null
+      ? `Payment succeeded on ${networkName}; charged amount unknown.`
+      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}.`;
   io.stdout(
     result.balance === null
-      ? `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance is not visible yet.`
-      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance: $${money(result.balance.remainingUsd)}.`,
+      ? `${payment} Router balance is not visible yet.`
+      : `${payment} Router balance: $${money(result.balance.remainingUsd)}.`,
   );
+  io.stdout(`Receipt: ${summary.receipt.id}`);
+  if (summary.receipt.transaction !== undefined)
+    io.stdout(`Transaction: ${summary.receipt.transaction}`);
+  for (const warning of result.warnings ?? []) io.stderr(warning.message);
 }
 
 async function keyCommand(
@@ -326,7 +397,7 @@ export function routerDeps(target: WalletTarget, dependencies: CliDependencies):
   };
 }
 
-async function refillIfAlreadyUnlocked(
+async function configuredRefill(
   target: WalletTarget,
   io: CliIo,
   dependencies: CliDependencies,
@@ -334,13 +405,13 @@ async function refillIfAlreadyUnlocked(
   if (target.entry.routerRefill === undefined) return undefined;
   try {
     const paths = getVapiPaths();
-    const { account } = await unlockTarget(target, { ...dependencies, interactive: false });
     const config = await loadConfig(paths.config, process.env, { notice: io.stderr });
     return {
-      account,
+      account: async () =>
+        (await unlockTarget(target, { ...dependencies, interactive: false })).account,
       config,
       caps: async () => {
-        await target.store.reload();
+        await target.store.refreshRegistry();
         return await spendCapsForWallet(target.store, target.name);
       },
       paths: { ledgerPath: paths.ledger, receiptsPath: paths.receipts },
