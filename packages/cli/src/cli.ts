@@ -1024,6 +1024,11 @@ export async function runCli(
           ? `${errorCode}: ${message}`
           : message,
       );
+      if (error instanceof RouterClientError && error.refill !== undefined) {
+        const receipt = error.toJSON().refill!.receipt;
+        runIo.stderr(`Receipt: ${receipt.id}`);
+        if (receipt.transaction !== undefined) runIo.stderr(`Transaction: ${receipt.transaction}`);
+      }
     }
     if (shouldAutoUploadAfterFailure(argv.filter((argument) => argument !== "--json"))) {
       await autoUploadBackup(io, json, dependencies);

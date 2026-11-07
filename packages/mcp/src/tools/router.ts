@@ -6,10 +6,9 @@ import {
   ownerStake,
   routerChat,
   routerUsage,
-  routerPurchaseSummary,
+  routerPurchaseView,
   type AgentRouterUsage,
   type RouterClientDeps,
-  type RouterPurchaseResult,
 } from "@vapi-network/core/router-client";
 import { z } from "zod";
 
@@ -206,7 +205,7 @@ export function createRouterTools(options: RouterToolsOptions): {
         content: result.content,
         model: result.model,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
-        ...(result.refill === undefined ? {} : { refill: publicPurchase(result.refill) }),
+        ...(result.refill === undefined ? {} : { refill: routerPurchaseView(result.refill) }),
       });
     },
 
@@ -254,24 +253,8 @@ export function createRouterTools(options: RouterToolsOptions): {
         },
         parsed.usd,
       );
-      return toolResult(publicPurchase(result));
+      return toolResult(routerPurchaseView(result));
     },
-  };
-}
-
-function publicPurchase(result: RouterPurchaseResult) {
-  return {
-    receipt: {
-      id: result.receipt.id,
-      ...routerPurchaseSummary(result.receipt),
-      ...(result.receipt.settlement?.transaction === undefined
-        ? {}
-        : { transaction: result.receipt.settlement.transaction }),
-    },
-    balance: publicBalance(result.balance),
-    ...(result.warnings === undefined
-      ? {}
-      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
   };
 }
 
@@ -294,16 +277,6 @@ function publicUsage(usage: AgentRouterUsage): AgentRouterUsage {
             remainingUsd: usage.balance.remainingUsd,
           },
   };
-}
-
-function publicBalance(usage: AgentRouterUsage["balance"]): AgentRouterUsage["balance"] {
-  return usage === null
-    ? null
-    : {
-        purchasedUsd: usage.purchasedUsd,
-        spentUsd: usage.spentUsd,
-        remainingUsd: usage.remainingUsd,
-      };
 }
 
 function routerDeps(

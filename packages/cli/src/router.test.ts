@@ -132,8 +132,7 @@ describe("vapi router buy", () => {
       ).toBe(0);
       expect(transport.calls.paid).toBe(1);
       expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
-        amountUsd: 4.75,
-        receiptId: expect.any(String),
+        receipt: { amountUsd: 4.75, id: expect.any(String) },
         warnings: [
           {
             code:
@@ -194,7 +193,10 @@ describe("vapi router buy", () => {
           dependencies,
         ),
       ).toBe(0);
-      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({ amountUsd, network, tierUsd: 5 });
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        receipt: { amountUsd, network },
+        tierUsd: 5,
+      });
       expect(buy).toHaveBeenCalledTimes(1);
 
       const human = captureIo();
@@ -221,7 +223,11 @@ describe("vapi router buy", () => {
         router: { buyRouterBalance: buy },
       }),
     ).toBe(0);
-    expect(captured.stdout).toEqual(["Paid $5.00 USDC on Base. Router balance: $7.40."]);
+    expect(captured.stdout).toEqual([
+      "Paid $5.00 USDC on Base. Router balance: $7.40.",
+      "Receipt: router-receipt",
+      "Transaction: 0xtransaction",
+    ]);
     expect(secret).not.toHaveBeenCalled();
     expect(buy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -234,6 +240,8 @@ describe("vapi router buy", () => {
       }),
       5,
     );
+    expect(allOutput(captured)).toContain("router-receipt");
+    expect(allOutput(captured)).toContain("0xtransaction");
   });
 
   it("prints a secret-free JSON summary and handles a not-yet-visible balance", async () => {
@@ -252,10 +260,12 @@ describe("vapi router buy", () => {
     ).toBe(0);
     expect(JSON.parse(json.stdout[0]!)).toEqual({
       tierUsd: 5,
-      amountUsd: 5,
-      network: "eip155:8453",
-      transaction: "0xtransaction",
-      receiptId: "router-receipt",
+      receipt: {
+        amountUsd: 5,
+        network: "eip155:8453",
+        transaction: "0xtransaction",
+        id: "router-receipt",
+      },
       balance: null,
     });
     expect(allOutput(json)).not.toContain(TEST_ROUTER_KEY);
@@ -264,7 +274,11 @@ describe("vapi router buy", () => {
     expect(await runCli(["router", "buy", "5", "--wallet", WALLET], human.io, dependencies)).toBe(
       0,
     );
-    expect(human.stdout).toEqual(["Paid $5.00 USDC on Base. Router balance is not visible yet."]);
+    expect(human.stdout).toEqual([
+      "Paid $5.00 USDC on Base. Router balance is not visible yet.",
+      "Receipt: router-receipt",
+      "Transaction: 0xtransaction",
+    ]);
   });
 
   it("stores and clears automatic refill without unlocking the wallet", async () => {
@@ -375,6 +389,24 @@ describe("vapi router buy", () => {
 });
 
 describe("vapi router chat", () => {
+  it("does not unlock the payment account for a credential-only retry", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home, { secrets: currentSecretStore() });
+    await store.setRouterRefill(WALLET, { tierUsd: 5, belowUsd: 2 });
+    const unlock = vi.spyOn(WalletStore.prototype, "unlock");
+    try {
+      const result = await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "retry"],
+        captureIo().io,
+        commandDependencies({ router: { routerChat: async () => chatResult() } }),
+      );
+      expect(result).toBe(0);
+      expect(unlock).not.toHaveBeenCalled();
+    } finally {
+      unlock.mockRestore();
+    }
+  });
+
   it("preserves settled refill evidence in chat errors and payment-aware guidance", async () => {
     await initializedHome();
     const purchase = {
@@ -417,6 +449,8 @@ describe("vapi router chat", () => {
       ),
     ).toBe(1);
     expect(human.stderr).toContain(message);
+    expect(human.stderr.join("\n")).toContain("router-receipt");
+    expect(human.stderr.join("\n")).toContain("0xtransaction");
   });
 
   it("keeps auto-refill warnings in chat JSON and human diagnostics", async () => {
@@ -443,7 +477,16 @@ describe("vapi router chat", () => {
     ).toBe(0);
     expect(JSON.parse(json.stdout[0]!)).toMatchObject({
       content: "Done.",
-      refill: { receiptId: "router-receipt", balance: null, warnings: refill.warnings },
+      refill: {
+        receipt: {
+          id: "router-receipt",
+          amountUsd: 5,
+          network: "eip155:8453",
+          transaction: "0xtransaction",
+        },
+        balance: null,
+        warnings: refill.warnings,
+      },
     });
     const human = captureIo();
     expect(
@@ -454,6 +497,8 @@ describe("vapi router chat", () => {
       ),
     ).toBe(0);
     expect(human.stderr).toContain(refill.warnings[0]!.message);
+    expect(allOutput(human)).toContain("router-receipt");
+    expect(allOutput(human)).toContain("0xtransaction");
   });
 
   it("builds system and user messages and prints human and JSON results", async () => {

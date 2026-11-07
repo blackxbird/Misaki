@@ -15,9 +15,8 @@ import {
   routerChat,
   routerCredentials,
   routerUsage,
-  routerPurchaseSummary,
+  routerPurchaseView,
   type RouterClientDeps,
-  type RouterPurchaseResult,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
 import { AGENT_LINK_REVOKED_MESSAGE } from "@vapi-network/core/agent-link";
@@ -160,7 +159,7 @@ async function chatCommand(
     ...(maxTokens === undefined ? {} : { max_tokens: maxTokens }),
   };
   const chat = dependencies.router?.routerChat ?? routerChat;
-  const refill = await refillIfAlreadyUnlocked(target, io, dependencies);
+  const refill = await configuredRefill(target, io, dependencies);
   const result = await withRouterError(() =>
     chat(
       {
@@ -176,12 +175,17 @@ async function chatCommand(
         model: result.model,
         content: result.content,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
-        ...(result.refill === undefined ? {} : { refill: publicPurchase(result.refill) }),
+        ...(result.refill === undefined ? {} : { refill: routerPurchaseView(result.refill) }),
       }),
     );
     return;
   }
   io.stdout(result.content ?? "");
+  if (result.refill !== undefined) {
+    io.stderr(`Receipt: ${result.refill.receipt.id}`);
+    if (result.refill.receipt.settlement?.transaction !== undefined)
+      io.stderr(`Transaction: ${result.refill.receipt.settlement.transaction}`);
+  }
   for (const warning of result.refill?.warnings ?? []) io.stderr(warning.message);
 }
 
@@ -259,8 +263,8 @@ async function buyCommand(
     throw error;
   }
 
-  const summary = { tierUsd, ...publicPurchase(result) };
-  const { amountUsd, network } = summary;
+  const summary = { tierUsd, ...routerPurchaseView(result) };
+  const { amountUsd, network } = summary.receipt;
   if (json) {
     io.stdout(JSON.stringify(summary));
     return;
@@ -275,6 +279,9 @@ async function buyCommand(
       ? `${payment} Router balance is not visible yet.`
       : `${payment} Router balance: $${money(result.balance.remainingUsd)}.`,
   );
+  io.stdout(`Receipt: ${summary.receipt.id}`);
+  if (summary.receipt.transaction !== undefined)
+    io.stdout(`Transaction: ${summary.receipt.transaction}`);
   for (const warning of result.warnings ?? []) io.stderr(warning.message);
 }
 
@@ -324,21 +331,7 @@ export function routerDeps(target: WalletTarget, dependencies: CliDependencies):
   };
 }
 
-function publicPurchase(result: RouterPurchaseResult) {
-  return {
-    ...routerPurchaseSummary(result.receipt),
-    ...(result.receipt.settlement?.transaction === undefined
-      ? {}
-      : { transaction: result.receipt.settlement.transaction }),
-    receiptId: result.receipt.id,
-    balance: result.balance,
-    ...(result.warnings === undefined
-      ? {}
-      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
-  };
-}
-
-async function refillIfAlreadyUnlocked(
+async function configuredRefill(
   target: WalletTarget,
   io: CliIo,
   dependencies: CliDependencies,
@@ -346,13 +339,13 @@ async function refillIfAlreadyUnlocked(
   if (target.entry.routerRefill === undefined) return undefined;
   try {
     const paths = getVapiPaths();
-    const { account } = await unlockTarget(target, { ...dependencies, interactive: false });
     const config = await loadConfig(paths.config, process.env, { notice: io.stderr });
     return {
-      account,
+      account: async () =>
+        (await unlockTarget(target, { ...dependencies, interactive: false })).account,
       config,
       caps: async () => {
-        await target.store.reload();
+        await target.store.refreshRegistry();
         return await spendCapsForWallet(target.store, target.name);
       },
       paths: { ledgerPath: paths.ledger, receiptsPath: paths.receipts },

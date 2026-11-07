@@ -13,14 +13,18 @@ scoped packages. The packages share one version and are released together.
 
 - `buyRouterBalance` returns `RouterPurchaseResult` with optional `PaymentWarning` entries. `routerPurchaseSummary`, CLI purchase JSON and MCP purchase output allow `amountUsd: null` and `network: "unknown"` when charged metadata is absent.
 - `payRequest` returns a confirmed in-memory receipt with warnings when receipt persistence or post-settlement processing fails, instead of rejecting. Callers must retain the receipt and must not repeat the payment for these warnings.
-- `RouterClientError` adds `refill_pending`, an optional settled `refill` purchase (fourth constructor argument), and a public `toJSON()` summary. `ChatResult` adds optional `refill: RouterPurchaseResult`; CLI/MCP chat results and errors preserve public payment evidence and warnings.
+- `RouterClientError` adds `refill_pending`, an optional prior `refill` purchase (fourth constructor argument, including interrupted purchases awaiting confirmation), and a public `toJSON()` summary. `ChatResult` adds optional `refill: RouterPurchaseResult`; CLI/MCP chat results and errors preserve public payment evidence and warnings.
 - Core exports the `PaymentWarning` type. The Router subentry exports `RouterPurchaseResult`, `RouterPurchaseWarning` and `routerPurchaseSummary`.
+- Wallet entries add public `routerPendingPurchase` recovery metadata and core exports `RouterPendingPurchase`. `WalletStore.setRouterPendingPurchase` atomically reserves, updates or clears a matching purchase. Concurrent clients sharing a wallet registry must use this schema so older writers do not discard the recovery record.
+- `PayRequestArgs` adds optional `receiptId` to correlate a durable purchase reservation with its receipt ledger entry. The Router subentry exports `routerPurchaseView`, the shared public receipt/warning projection.
+- CLI Router purchase/refill JSON now matches MCP: `receipt.id`, `receipt.amountUsd`, `receipt.network` and optional `receipt.transaction` replace the flat `receiptId`, `amountUsd`, `network` and `transaction` fields. Human output includes the public receipt and transaction references.
 
 ### Fixed
 
 - Confirmed x402 payments retain their receipt and report a warning when an injected timing clock throws during final receipt construction.
 - Confirmed Router purchases retain their receipts when audit, key retrieval/storage, balance lookup, receipt persistence or later response processing fails. Explicit warnings report these failures; unavailable balance is `null`.
 - First automatic Router refills retain settled receipts through console, credential and chat failures. Payment-aware guidance explains pending key recovery; the next chat request fetches the missing balance key without a second purchase.
+- Pending Router purchases survive process restarts and are recovered before any refill decision, including manual purchases with automatic refill disabled. An unresolved purchase blocks another payment; credential-only chat retries do not unlock the payment account.
 - CLI and MCP report the charged quote amount and network from available receipt evidence. Missing network metadata no longer throws after payment or silently guesses a network.
 - x402 receipt metadata is snapshotted and validated before payment. Failures after confirmed settlement return the receipt and warnings instead of rejecting.
 

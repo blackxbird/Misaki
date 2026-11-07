@@ -91,6 +91,21 @@ const routerRefillSchema: z.ZodType<RouterRefill> = z.object({
   tierUsd: z.union([z.literal(1), z.literal(5), z.literal(20), z.literal(50)]),
 });
 
+// Public payment evidence only. A prepared record survives a crash or a failed
+// post-settlement registry write; its receipt id also identifies the ledger row.
+const routerPendingPurchaseSchema = z.strictObject({
+  receiptId: z.string().min(1),
+  status: z.enum(["prepared", "settled"]),
+  createdAt: z.iso.datetime(),
+  tierUsd: z.union([z.literal(1), z.literal(5), z.literal(20), z.literal(50)]),
+  link: agentLinkSchema,
+  network: z.string().min(1).optional(),
+  amountAtomic: z.string().regex(/^\d+$/u).optional(),
+  transaction: z.string().optional(),
+});
+
+export type RouterPendingPurchase = z.infer<typeof routerPendingPurchaseSchema>;
+
 const ceilingSweepPendingSchema = z.strictObject({
   owner: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   target: z
@@ -116,6 +131,7 @@ export const walletEntrySchema = z.object({
   ceilingSweepAttemptedAt: z.iso.datetime().optional(),
   ceilingSweepPending: ceilingSweepPendingSchema.optional(),
   routerRefill: routerRefillSchema.optional(),
+  routerPendingPurchase: routerPendingPurchaseSchema.optional(),
   link: agentLinkSchema.optional(),
 });
 
@@ -789,6 +805,27 @@ export class WalletStore {
         throw new KeystoreError(unknownWalletMessage(wallet.name, Object.keys(registry.wallets)));
       if (parsed === undefined) delete entry.routerRefill;
       else entry.routerRefill = parsed;
+    });
+    return structuredClone(registry.wallets[wallet.name]!);
+  }
+
+  /** Atomically reserve a purchase, or update/clear the matching reservation.
+   * A competing reservation is returned unchanged. No payment may precede this write.
+   */
+  async setRouterPendingPurchase(
+    name: string,
+    pending: RouterPendingPurchase | null,
+    expectedReceiptId?: string,
+  ): Promise<WalletEntry> {
+    const parsed = pending === null ? undefined : routerPendingPurchaseSchema.parse(pending);
+    const wallet = this.resolve({ name });
+    const registry = await this.update((registry) => {
+      const entry = registry.wallets[wallet.name];
+      if (!entry)
+        throw new KeystoreError(unknownWalletMessage(wallet.name, Object.keys(registry.wallets)));
+      if (entry.routerPendingPurchase?.receiptId !== expectedReceiptId) return;
+      if (parsed === undefined) delete entry.routerPendingPurchase;
+      else entry.routerPendingPurchase = parsed;
     });
     return structuredClone(registry.wallets[wallet.name]!);
   }

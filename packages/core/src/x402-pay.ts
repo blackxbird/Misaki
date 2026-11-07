@@ -41,6 +41,8 @@ export type PayRequestArgs = {
   maxAtomic?: bigint;
   preferNetworks?: string[];
   paymentId?: string;
+  /** Caller-allocated journal id, persisted before paying when recovery requires it. */
+  receiptId?: string;
   now?: Date;
   allowanceExpiresAt?: Date;
   nowMs?: () => number;
@@ -169,7 +171,7 @@ export async function payRequest(input: PayRequestArgs): Promise<PayRequestResul
   assertAllowanceCurrent(startedAt, args.allowanceExpiresAt);
   const nowMs = args.nowMs ?? (() => performance.now());
   const startedMs = nowMs();
-  const receiptId = randomUUID();
+  const receiptId = args.receiptId ?? randomUUID();
   const trace: X402PaymentTrace = { phases: {}, capsApplied: false };
   const defaults = getVapiPaths();
   const ledgerPath = args.paths?.ledgerPath ?? defaults.ledger;
