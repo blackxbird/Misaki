@@ -1410,7 +1410,7 @@ export function createVapiServer(options: VapiServerOptions = {}) {
               }
             : swarmErrorResult(error),
       );
-      return "structuredContent" in result &&
+      return !("isError" in result) &&
         Array.isArray(result.structuredContent.failed) &&
         result.structuredContent.failed.length > 0
         ? { ...result, isError: true as const }
