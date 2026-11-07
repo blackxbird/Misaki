@@ -874,6 +874,14 @@ export class WalletStore {
     return await withFileLock(`${this.routerPurchasePath(name)}.purchase.lock`, operation);
   }
 
+  private assertNoPendingRouterPurchase(name: WalletName): void {
+    if (this.entry(name)?.routerPendingPurchase !== undefined) {
+      throw new KeystoreError(
+        `Account ${name} has a pending Router purchase. Resolve it with vapi router clear-pending --account ${name} before renaming or removing the account.`,
+      );
+    }
+  }
+
   async routerCompletedPurchase(name: string): Promise<string | undefined> {
     return (await this.readRouterPurchaseState(name)).completedReceiptId;
   }
@@ -949,16 +957,19 @@ export class WalletStore {
     const source = assertWalletName(oldName.trim());
     const target = assertWalletName(newName);
     try {
-      return await withAccountMovementLocks(this.home, [source, target], undefined, async () => {
-        return await withAccountMutationLocks(
-          this.home,
-          [source, target],
-          `vapi accounts rename ${source} ${target}`,
-          async () => {
-            await this.reload();
-            return await this.renameWithMovementLocksHeld(source, target, options);
-          },
-        );
+      return await this.withRouterPurchaseLock(source, async () => {
+        return await withAccountMovementLocks(this.home, [source, target], undefined, async () => {
+          return await withAccountMutationLocks(
+            this.home,
+            [source, target],
+            `vapi accounts rename ${source} ${target}`,
+            async () => {
+              await this.reload();
+              this.assertNoPendingRouterPurchase(source);
+              return await this.renameWithMovementLocksHeld(source, target, options);
+            },
+          );
+        });
       });
     } catch (error) {
       if (error instanceof AccountMovementLockedError) {
@@ -1064,9 +1075,12 @@ export class WalletStore {
   async remove(name: string, options: WalletRemoveOptions = {}): Promise<TrashedWallet> {
     const account = assertWalletName(name.trim());
     try {
-      return await withAccountMovementLocks(this.home, [account], undefined, async () => {
-        await this.reload();
-        return await this.removeWithMovementLockHeld(account, options);
+      return await this.withRouterPurchaseLock(account, async () => {
+        return await withAccountMovementLocks(this.home, [account], undefined, async () => {
+          await this.reload();
+          this.assertNoPendingRouterPurchase(account);
+          return await this.removeWithMovementLockHeld(account, options);
+        });
       });
     } catch (error) {
       if (error instanceof AccountMovementLockedError) {
