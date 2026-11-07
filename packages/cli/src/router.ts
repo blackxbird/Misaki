@@ -1,7 +1,6 @@
 import {
   SpendCapError,
   SpendCapExceededError,
-  formatUsdc,
   getNetworkDefinition,
   getVapiPaths,
   loadConfig,
@@ -16,7 +15,9 @@ import {
   routerChat,
   routerCredentials,
   routerUsage,
+  routerPurchaseSummary,
   type RouterClientDeps,
+  type RouterPurchaseResult,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
 import { AGENT_LINK_REVOKED_MESSAGE } from "@vapi-network/core/agent-link";
@@ -175,11 +176,13 @@ async function chatCommand(
         model: result.model,
         content: result.content,
         ...(result.usage === undefined ? {} : { usage: result.usage }),
+        ...(result.refill === undefined ? {} : { refill: publicPurchase(result.refill) }),
       }),
     );
     return;
   }
   io.stdout(result.content ?? "");
+  for (const warning of result.refill?.warnings ?? []) io.stderr(warning.message);
 }
 
 async function buyCommand(
@@ -256,28 +259,23 @@ async function buyCommand(
     throw error;
   }
 
-  const amountAtomic = result.receipt.quote?.amountAtomic ?? String(tierUsd * 1_000_000);
-  const amountUsd = Number(formatUsdc(BigInt(amountAtomic)));
-  const network = result.receipt.quote?.network ?? "eip155:8453";
-  const transaction = result.receipt.settlement?.transaction;
-  const summary = {
-    tierUsd,
-    amountUsd,
-    network,
-    ...(transaction === undefined ? {} : { transaction }),
-    receiptId: result.receipt.id,
-    balance: result.balance,
-  };
+  const summary = { tierUsd, ...publicPurchase(result) };
+  const { amountUsd, network } = summary;
   if (json) {
     io.stdout(JSON.stringify(summary));
     return;
   }
   const networkName = networkDisplayName(network);
+  const payment =
+    amountUsd === null
+      ? `Payment succeeded on ${networkName}; charged amount unknown.`
+      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}.`;
   io.stdout(
     result.balance === null
-      ? `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance is not visible yet.`
-      : `Paid $${amountUsd.toFixed(2)} USDC on ${networkName}. Router balance: $${money(result.balance.remainingUsd)}.`,
+      ? `${payment} Router balance is not visible yet.`
+      : `${payment} Router balance: $${money(result.balance.remainingUsd)}.`,
   );
+  for (const warning of result.warnings ?? []) io.stderr(warning.message);
 }
 
 async function keyCommand(
@@ -323,6 +321,20 @@ export function routerDeps(target: WalletTarget, dependencies: CliDependencies):
     wallets: target.store,
     wallet: target.name,
     ...(dependencies.fetchImpl === undefined ? {} : { fetchImpl: dependencies.fetchImpl }),
+  };
+}
+
+function publicPurchase(result: RouterPurchaseResult) {
+  return {
+    ...routerPurchaseSummary(result.receipt),
+    ...(result.receipt.settlement?.transaction === undefined
+      ? {}
+      : { transaction: result.receipt.settlement.transaction }),
+    receiptId: result.receipt.id,
+    balance: result.balance,
+    ...(result.warnings === undefined
+      ? {}
+      : { warnings: result.warnings.map(({ code, message }) => ({ code, message })) }),
   };
 }
 

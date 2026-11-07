@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import type { Address } from "viem";
+import { RouterClientError } from "@vapi-network/core/router-client";
 
 import {
   BASE_MAINNET_CAIP2,
@@ -1001,6 +1002,9 @@ export async function runCli(
             error: message,
             exitCode: code,
             ...(error instanceof RuntimeError ? { code: error.code } : {}),
+            ...(error instanceof RouterClientError && error.refill !== undefined
+              ? { code: error.code, refill: error.toJSON().refill }
+              : {}),
             ...(error instanceof VapiCallError ? { code: error.code } : {}),
             ...(error instanceof DocsError ? { code: error.code } : {}),
             ...(error instanceof RemoteKeyRefusedError ? { code: error.code } : {}),
