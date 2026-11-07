@@ -97,6 +97,49 @@ async function paths() {
 }
 
 describe("payRequest", () => {
+  it("retains settlement evidence when the final receipt clock throws", async () => {
+    const localPaths = await paths();
+    const paid = paidResponse();
+    let finalClock = false;
+    const get = paid.headers.get.bind(paid.headers);
+    vi.spyOn(paid.headers, "get").mockImplementation((name) => {
+      if (name.toLowerCase() === "x-vapi-payment-proof") finalClock = true;
+      return get(name);
+    });
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(paymentRequired())
+      .mockResolvedValueOnce(paid);
+    const result = await payRequest({
+      url: "https://vendor.example/paid",
+      init: { method: "POST" },
+      account: privateKeyToAccount(PRIVATE_KEY),
+      wallet: "main",
+      caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+      config: getDefaultConfig(),
+      fetchImpl,
+      paths: localPaths,
+      now: NOW,
+      nowMs: () => {
+        if (finalClock) throw new Error("private-clock-error");
+        return 0;
+      },
+      lookup: async () => ["93.184.216.34"],
+    });
+    expect(result.receipt).toMatchObject({
+      outcome: "paid",
+      settlement: { outcome: "succeeded" },
+      quote: { amountAtomic: "2500" },
+      latencyMs: 0,
+    });
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([expect.objectContaining({ code: "payment_followup_unavailable" })]),
+    );
+    expect(JSON.stringify(result)).not.toContain("private-clock-error");
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect((await readReceipts(localPaths.receiptsPath))[0]?.id).toBe(result.receipt.id);
+  });
+
   it("validates receipt metadata before sending a payment", async () => {
     const localPaths = await paths();
     const fetchImpl = vi

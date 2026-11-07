@@ -18,6 +18,7 @@ scoped packages. The packages share one version and are released together.
 
 ### Fixed
 
+- Confirmed x402 payments retain their receipt and report a warning when an injected timing clock throws during final receipt construction.
 - Confirmed Router purchases retain their receipts when audit, key retrieval/storage, balance lookup, receipt persistence or later response processing fails. Explicit warnings report these failures; unavailable balance is `null`.
 - First automatic Router refills retain settled receipts through console, credential and chat failures. Payment-aware guidance explains pending key recovery; the next chat request fetches the missing balance key without a second purchase.
 - CLI and MCP report the charged quote amount and network from available receipt evidence. Missing network metadata no longer throws after payment or silently guesses a network.

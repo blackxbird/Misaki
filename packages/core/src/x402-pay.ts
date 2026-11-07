@@ -261,17 +261,23 @@ export async function payRequest(input: PayRequestArgs): Promise<PayRequestResul
     }
   }
 
-  let receipt = directReceipt(
-    args,
-    receiptRequest,
-    trace,
-    receiptId,
-    startedAt,
-    elapsed(nowMs, startedMs),
-    {
-      outcome,
-    },
-  );
+  let latencyMs: number;
+  try {
+    latencyMs = elapsed(nowMs, startedMs);
+  } catch (error) {
+    if (trace.settlement?.outcome !== "succeeded") throw error;
+    latencyMs = 0;
+    if (!warnings.some((warning) => warning.code === "payment_followup_unavailable")) {
+      warnings.push({
+        code: "payment_followup_unavailable",
+        message:
+          "Payment settled, but timing metadata is unavailable. Keep the returned receipt; do not repeat the payment.",
+      });
+    }
+  }
+  let receipt = directReceipt(args, receiptRequest, trace, receiptId, startedAt, latencyMs, {
+    outcome,
+  });
   try {
     receipt = await appendReceipt(receipt, receiptsPath, { wallet: args.wallet });
   } catch (error) {
