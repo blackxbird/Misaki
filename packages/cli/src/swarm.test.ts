@@ -2188,13 +2188,15 @@ describe("vapi swarm railway runs", () => {
 
   it.each([
     "destroyed",
+    "experimental-warning",
     "gone",
+    "timeout-124",
     "error",
     "wrong-project",
     "conflicting-scope",
     "mixed-output",
   ] as const)("recovers an unknown Railway run through stop --all (%s)", async (outcome) => {
-    const stopFails = outcome !== "destroyed" && outcome !== "gone";
+    const stopFails = outcome !== "destroyed" && outcome !== "experimental-warning";
     const home = await homeWithStoredSwarm("vapi-swarm-unknown-stop-");
     const member = { swarm: "team", account: "team-lead-1", profile: "team-lead-1" };
     const handle = {
@@ -2226,13 +2228,20 @@ describe("vapi swarm railway runs", () => {
         return { code: 1, stdout: "", stderr: "Error: Sandbox sbx_9 not found" };
       if (args[1] === "destroy") {
         destroys.push(args[2]!);
-        return outcome === "destroyed"
-          ? { code: 0, stdout: "", stderr: "" }
+        return outcome === "destroyed" || outcome === "experimental-warning"
+          ? {
+              code: 0,
+              stdout: "",
+              stderr:
+                outcome === "experimental-warning"
+                  ? "Warning: Railway sandboxes are experimental and APIs may change or break during testing."
+                  : "",
+            }
           : {
-              code: 1,
+              code: outcome === "timeout-124" ? 124 : 1,
               stdout: outcome === "mixed-output" ? "Error: authentication failed" : "",
               stderr:
-                outcome === "gone"
+                outcome === "gone" || outcome === "timeout-124"
                   ? "Error: Sandbox sbx_9 not found"
                   : outcome === "wrong-project"
                     ? "sandbox sbx_9 not found in project wrong-project"
@@ -2274,12 +2283,250 @@ describe("vapi swarm railway runs", () => {
       stopFails ? { code: "swarm_workers_active" } : { status: "dissolved" },
     );
     if (stopFails) {
+      expect(onlyLine(dissolved.stdout)).toContain(
+        `vapi swarm forget-run team ${ORPHAN_RUN} --confirm-destroyed`,
+      );
       expect(balanceReader).not.toHaveBeenCalled();
       expect(JSON.parse(onlyLine(stopped.stdout))).toMatchObject({
         failed: [{ runId: ORPHAN_RUN }],
       });
       await expect(readSwarm(home, "team")).resolves.toBeDefined();
     }
+    expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { state: "unknown", confirmed: false, allowed: false, legacy: false },
+    { state: "running", confirmed: true, allowed: false, legacy: false },
+    { state: "unknown", confirmed: true, allowed: true, legacy: false },
+    { state: "orphaned", confirmed: true, allowed: true, legacy: false },
+    { state: "unknown", confirmed: true, allowed: true, legacy: true },
+  ] as const)(
+    "forgets only an explicitly confirmed unresolved Railway run ($state, confirmed=$confirmed, legacy=$legacy)",
+    async ({ state, confirmed, allowed, legacy }) => {
+      const home = await homeWithStoredSwarm("vapi-swarm-forget-run-");
+      const member = { swarm: "team", account: "team-lead-1", profile: "team-lead-1" };
+      const scope = { projectId: "original-project", environmentId: "original-environment" };
+      const startedAt = "2026-09-30T08:00:00.000Z";
+      // Write the proposed record shape directly so this regression runs before
+      // the new schema/state are implemented.
+      await mkdir(join(home, "runs"), { recursive: true });
+      await writeFile(
+        join(home, "runs", `${ORPHAN_RUN}.json`),
+        JSON.stringify({
+          v: 1,
+          runId: ORPHAN_RUN,
+          kind: "railway",
+          member,
+          handle: {
+            runId: ORPHAN_RUN,
+            kind: "railway",
+            member,
+            ref: "sbx_9",
+            startedAt,
+            railwayScope: scope,
+          },
+          run: { runId: ORPHAN_RUN, task: "Work", mode: "agent" },
+          state,
+          startedAt,
+        }),
+      );
+      await writeSidecarFile(home, {
+        runId: ORPHAN_RUN,
+        account: member.account,
+        state: "orphaned",
+        sandboxId: "sbx_9",
+      });
+      if (legacy)
+        await writeFile(
+          join(home, "runs", `${ORPHAN_RUN}.railway.json`),
+          JSON.stringify({
+            v: 1,
+            sandboxId: "sbx_9",
+            checkpoint: "original-checkpoint",
+            keepSandbox: false,
+          }),
+        );
+      const exec = vi.fn<RailwayExec>();
+      const transfer = vi.fn<MovementTransfer>();
+      const balanceReader = vi.fn(async () => (allowed ? 0n : 1_000_000n));
+      const deps = {
+        ...railwayDependencies(exec),
+        now: () => new Date("2026-11-07T12:00:00.000Z"),
+        swarm: { transfer, balanceReader },
+      };
+      const before = captureIo();
+      expect(await run(["swarm", "dissolve", "team", "--json"], before.io, deps)).toBe(1);
+      expect(transfer).not.toHaveBeenCalled();
+      exec.mockClear(); // Ignore the earlier dissolve reconciliation, not forget-run.
+      const captured = captureIo();
+      const code = await run(
+        [
+          "swarm",
+          "forget-run",
+          "team",
+          ORPHAN_RUN,
+          ...(confirmed ? ["--confirm-destroyed"] : []),
+          "--json",
+        ],
+        captured.io,
+        deps,
+      );
+      expect(code).toBe(allowed ? 0 : confirmed ? 1 : 2);
+      const payload = JSON.parse(onlyLine(captured.stdout));
+      if (!allowed) {
+        expect(payload.error).toContain(confirmed ? "unknown or orphaned" : "--confirm-destroyed");
+        expect(
+          JSON.parse(await readFile(join(home, "runs", `${ORPHAN_RUN}.json`), "utf8")).state,
+        ).toBe(state);
+      } else {
+        expect(payload).toMatchObject({
+          swarm: "team",
+          runId: ORPHAN_RUN,
+          sandboxId: "sbx_9",
+          projectId: scope.projectId,
+          environmentId: scope.environmentId,
+          check:
+            "railway sandbox list --project original-project --environment original-environment",
+          state: "forgotten",
+          confirmedBy: "cli",
+          forgottenAt: "2026-11-07T12:00:00.000Z",
+        });
+        expect((await listRunRecords(home))[0]).toMatchObject({
+          state: "forgotten",
+          forgottenAt: payload.forgottenAt,
+          confirmedBy: "cli",
+        });
+        const dissolved = captureIo();
+        expect(await run(["swarm", "dissolve", "team", "--json"], dissolved.io, deps)).toBe(0);
+        expect(JSON.parse(onlyLine(dissolved.stdout))).toMatchObject({ status: "dissolved" });
+      }
+      expect(exec).not.toHaveBeenCalled();
+      expect(transfer).not.toHaveBeenCalled();
+    },
+  );
+
+  it("refuses a legacy sidecar naming a different sandbox than the confirmed run", async () => {
+    const home = await homeWithStoredSwarm("vapi-swarm-forget-foreign-sidecar-");
+    const member = { swarm: "team", account: "team-lead-1", profile: "team-lead-1" };
+    const startedAt = "2026-09-30T08:00:00.000Z";
+    await writeRunRecord(home, {
+      v: 1,
+      runId: ORPHAN_RUN,
+      kind: "railway",
+      member,
+      handle: { runId: ORPHAN_RUN, kind: "railway", member, ref: "sbx_9", startedAt },
+      run: { runId: ORPHAN_RUN, task: "Work", mode: "agent" },
+      state: "unknown",
+      startedAt,
+    });
+    const path = join(home, "runs", `${ORPHAN_RUN}.railway.json`);
+    await writeFile(
+      path,
+      JSON.stringify({
+        v: 1,
+        sandboxId: "sbx_other",
+        checkpoint: "original-checkpoint",
+        keepSandbox: false,
+      }),
+    );
+    const exec = vi.fn<RailwayExec>();
+    const captured = captureIo();
+    expect(
+      await run(
+        ["swarm", "forget-run", "team", ORPHAN_RUN, "--confirm-destroyed", "--json"],
+        captured.io,
+        railwayDependencies(exec),
+      ),
+    ).toBe(1);
+    expect(JSON.parse(onlyLine(captured.stdout)).error).toContain("mismatched Railway sidecar");
+    expect((await listRunRecords(home))[0]?.state).toBe("unknown");
+    expect(JSON.parse(await readFile(path, "utf8")).sandboxId).toBe("sbx_other");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("retains an orphan-only record and reports missing original scope without running Railway", async () => {
+    const home = await homeWithStoredSwarm("vapi-swarm-forget-orphan-");
+    await writeSidecarFile(home, {
+      runId: ORPHAN_RUN,
+      account: "team-lead-1",
+      state: "orphaned",
+      sandboxId: "sbx_9",
+    });
+    const exec = vi.fn<RailwayExec>();
+    const transfer = vi.fn<MovementTransfer>();
+    const deps = {
+      ...railwayDependencies(exec),
+      swarm: { balanceReader: async () => 0n, transfer },
+    };
+    const captured = captureIo();
+    expect(
+      await run(
+        ["swarm", "forget-run", "team", ORPHAN_RUN, "--confirm-destroyed", "--json"],
+        captured.io,
+        deps,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(onlyLine(captured.stdout))).toMatchObject({
+      state: "forgotten",
+      confirmedBy: "cli",
+      sandboxId: "sbx_9",
+      projectId: null,
+      environmentId: null,
+      check:
+        "railway sandbox list --project <original-project> --environment <original-environment>",
+    });
+    expect(captured.stderr.join("\n")).toContain("Original Railway project: not recorded");
+    expect(captured.stderr.join("\n")).toContain("Original Railway environment: not recorded");
+    expect((await listRunRecords(home))[0]).toMatchObject({
+      runId: ORPHAN_RUN,
+      state: "forgotten",
+      forgottenAt: expect.any(String),
+      confirmedBy: "cli",
+    });
+    expect(
+      (await readdir(join(home, "runs"))).filter((file) => file.endsWith(".railway.json")),
+    ).toEqual([]);
+    expect(await run(["swarm", "dissolve", "team", "--json"], captureIo().io, deps)).toBe(0);
+    expect((await listRunRecords(home))[0]?.state).toBe("forgotten");
+    expect(exec).not.toHaveBeenCalled();
+    expect(transfer).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { confirmedBy: "cli" },
+    { forgottenAt: "2026-11-07T12:00:00.000Z" },
+    { confirmedBy: "mcp", forgottenAt: "2026-11-07T12:00:00.000Z" },
+  ])("refuses an unconfirmed forgotten marker before moving money (%j)", async (marker) => {
+    const home = await homeWithStoredSwarm("vapi-swarm-unconfirmed-forget-");
+    const member = { swarm: "team", account: "team-lead-1", profile: "team-lead-1" };
+    const startedAt = "2026-09-30T08:00:00.000Z";
+    await mkdir(join(home, "runs"), { recursive: true });
+    await writeFile(
+      join(home, "runs", `${ORPHAN_RUN}.json`),
+      JSON.stringify({
+        v: 1,
+        runId: ORPHAN_RUN,
+        kind: "railway",
+        member,
+        startedAt,
+        state: "forgotten",
+        ...marker,
+        handle: { runId: ORPHAN_RUN, kind: "railway", member, ref: "sbx_9", startedAt },
+        run: { runId: ORPHAN_RUN, task: "Work", mode: "agent" },
+      }),
+    );
+    const balanceReader = vi.fn(async () => 1_000_000n);
+    const transfer = vi.fn<MovementTransfer>();
+    const captured = captureIo();
+    expect(
+      await run(["swarm", "dissolve", "team", "--json"], captured.io, {
+        ...railwayDependencies(vi.fn()),
+        swarm: { balanceReader, transfer },
+      }),
+    ).toBe(1);
+    expect(JSON.parse(onlyLine(captured.stdout))).toMatchObject({ code: "swarm_workers_active" });
+    expect(balanceReader).not.toHaveBeenCalled();
     expect(transfer).not.toHaveBeenCalled();
   });
 

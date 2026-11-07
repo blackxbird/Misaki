@@ -1337,7 +1337,7 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     "swarm.stop",
     {
       description:
-        "Stop one or all tracked workers of a swarm, including unknown runs. A successful stop confirms destruction or absence; failed stops remain unresolved. Does not move money or start workers.",
+        "Stop one or all tracked workers of a swarm, including unknown runs. Unknown Railway runs require a successful destroy exit; not-found text never clears them. Failed stops remain unresolved. Does not move money or expose CLI-only human confirmation.",
       inputSchema: stopInput.shape,
       strictInput: true,
       outputSchema: z.object({
@@ -1367,9 +1367,9 @@ export function createVapiServer(options: VapiServerOptions = {}) {
           const failed: Array<{ runId: string; member: string; code: string; error: string }> = [];
           for (const record of targets) {
             if (
-              record.state === "finished" ||
-              record.state === "failed" ||
-              record.state === "stopped"
+              record.state !== "starting" &&
+              record.state !== "running" &&
+              record.state !== "unknown"
             ) {
               unchanged.push(summarizeRunRecord(record));
               continue;

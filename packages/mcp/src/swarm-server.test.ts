@@ -198,7 +198,7 @@ describe("MCP swarm lifecycle", () => {
         expect(Boolean(stopped.isError)).toBe(fails);
         expect(runtimeForStop).toHaveBeenCalledWith("railway");
         expect(stop).toHaveBeenCalledOnce();
-        expect(stop).toHaveBeenCalledWith(handle);
+        expect(stop).toHaveBeenCalledWith(handle, { requireSuccessfulExit: true });
         expect((await listRunRecords(home))[0]?.state).toBe(fails ? "unknown" : "stopped");
         const dissolved = await fixture.server.callTool({
           name: "swarm.dissolve",

@@ -50,6 +50,8 @@ export type RuntimeHandle = {
   startedAt: string;
   /** Adapter-specific process or sandbox reference. It must never contain a secret. */
   ref: string;
+  /** Original creation scope, when returned by Railway; never today's linked scope. */
+  railwayScope?: { projectId?: string; environmentId?: string };
 };
 
 export type RuntimeStatus = {
@@ -74,11 +76,11 @@ export interface Runtime {
   recover?(record: RunRecord): Promise<RuntimeHandle | undefined>;
   /** Retire this exact adapter-owned start after the owner confirms its worker is gone. */
   retireUnreconciledStart?(record: RunRecord): Promise<void>;
-  stop(handle: RuntimeHandle): Promise<void>;
+  stop(handle: RuntimeHandle, options?: { requireSuccessfulExit: true }): Promise<void>;
   status(handle: RuntimeHandle): Promise<RuntimeStatus>;
 }
 
-export type RunState = RuntimeStatus["state"] | "starting";
+export type RunState = RuntimeStatus["state"] | "starting" | "orphaned" | "forgotten";
 
 export class RuntimeError extends Error {
   readonly name = "RuntimeError";
@@ -104,6 +106,8 @@ export type RunRecord = {
   exitCode?: number;
   resultPath?: string;
   detail?: string;
+  forgottenAt?: string;
+  confirmedBy?: "cli";
 };
 
 /** A normal adapter launch should have produced a durable reference well before this bound. */
@@ -131,22 +135,48 @@ const runtimeHandleSchema: z.ZodType<RuntimeHandle> = z.strictObject({
   member: runtimeMemberSchema,
   startedAt: z.iso.datetime(),
   ref: z.string(),
+  railwayScope: z
+    .strictObject({
+      projectId: z.string().min(1).optional(),
+      environmentId: z.string().min(1).optional(),
+    })
+    .optional(),
 });
 
-export const runRecordSchema: z.ZodType<RunRecord> = z.strictObject({
-  v: z.literal(1),
-  runId: runIdSchema,
-  kind: runtimeKindSchema,
-  member: runtimeMemberSchema,
-  run: runtimeRunSchema,
-  handle: runtimeHandleSchema,
-  startedAt: z.iso.datetime(),
-  endedAt: z.iso.datetime().optional(),
-  state: z.enum(["starting", "running", "finished", "failed", "stopped", "unknown"]),
-  exitCode: z.number().int().optional(),
-  resultPath: z.string().optional(),
-  detail: z.string().optional(),
-});
+export const runRecordSchema: z.ZodType<RunRecord> = z
+  .strictObject({
+    v: z.literal(1),
+    runId: runIdSchema,
+    kind: runtimeKindSchema,
+    member: runtimeMemberSchema,
+    run: runtimeRunSchema,
+    handle: runtimeHandleSchema,
+    startedAt: z.iso.datetime(),
+    endedAt: z.iso.datetime().optional(),
+    state: z.enum([
+      "starting",
+      "running",
+      "finished",
+      "failed",
+      "stopped",
+      "unknown",
+      "orphaned",
+      "forgotten",
+    ]),
+    exitCode: z.number().int().optional(),
+    resultPath: z.string().optional(),
+    detail: z.string().optional(),
+    forgottenAt: z.iso.datetime().optional(),
+    confirmedBy: z.literal("cli").optional(),
+  })
+  .refine(
+    (record) =>
+      record.state !== "forgotten" ||
+      (record.forgottenAt !== undefined && record.confirmedBy === "cli"),
+    {
+      message: "A forgotten run requires a timestamp and explicit CLI confirmation.",
+    },
+  );
 
 export function runsDirectory(home: string): string {
   return join(home, "runs");
@@ -551,7 +581,11 @@ export async function stopRun(args: {
           }
           await args.runtime.retireUnreconciledStart?.(current);
         } else {
-          await args.runtime.stop(current.handle);
+          if (current.kind === "railway" && current.state === "unknown") {
+            await args.runtime.stop(current.handle, { requireSuccessfulExit: true });
+          } else {
+            await args.runtime.stop(current.handle);
+          }
         }
         const stopped: RunRecord = {
           ...current,
@@ -586,6 +620,8 @@ export type DetachedRunSummary = {
   exitCode?: number;
   parentRunId?: string;
   detail?: string;
+  forgottenAt?: string;
+  confirmedBy?: "cli";
 };
 
 export type DetachedSwarmRunResult = {
@@ -611,6 +647,8 @@ export function summarizeRunRecord(record: RunRecord): DetachedRunSummary {
     ...(record.exitCode === undefined ? {} : { exitCode: record.exitCode }),
     ...(record.run.parentRunId === undefined ? {} : { parentRunId: record.run.parentRunId }),
     ...(record.detail === undefined ? {} : { detail: record.detail }),
+    ...(record.forgottenAt === undefined ? {} : { forgottenAt: record.forgottenAt }),
+    ...(record.confirmedBy === undefined ? {} : { confirmedBy: record.confirmedBy }),
   };
 }
 

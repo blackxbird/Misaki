@@ -316,6 +316,7 @@ describe("Agent Cash MCP marketplace tools", () => {
       "swarm.runs",
     ]);
     expect(names).toContain("swarm.stop");
+    expect(names.some((name) => /forget/iu.test(name))).toBe(false);
     const inspect = tools.tools.find((tool) => tool.name === "call.inspect");
     expect(inspect?.description).toContain("for free");
     expect(inspect?.description).toContain("before call");

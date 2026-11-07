@@ -225,6 +225,7 @@ Usage:
   vapi swarm run <name> "<task>" --mode each --runtime railway --checkpoint <name> --allow-remote-key [--budget <usd>] [--keep-sandbox] [--json]
   vapi swarm runs <name> [--json]
   vapi swarm stop <name> [<runId>|--all] [--confirm-worker-stopped] [--json]
+  vapi swarm forget-run <name> <runId> --confirm-destroyed [--json]
   vapi send <amount> --from <account> --to <account|owner|0x…> [--network base|arc] [--resume <nonce>] [--json]
   vapi fund [--amount <usd>] [--account <name>] [--json]
   vapi docs "<question>" [--json]

@@ -133,6 +133,10 @@ export const RAILWAY_CHECKPOINT_RULE =
 
 const SANDBOX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const MISSING_FILE_PATTERN = /no such file or directory/iu;
+const HTTP_NOT_FOUND_PATTERN = /\b404\b/u;
+/** Any other thing a Railway error can report missing; its not-found says nothing about the sandbox. */
+const OTHER_SCOPE_PATTERN =
+  /\b(?:project|environment|service|workspace|team|token|user|account|volume|deployment|command|file|directory|module|package)s?\b/iu;
 const SIDECAR_SUFFIX = ".railway.json";
 const MINIMUM_SECRET_LENGTH = 8;
 
@@ -191,6 +195,39 @@ function sandboxIdOf(value: unknown): string | undefined {
     if (typeof id === "string" && SANDBOX_ID_PATTERN.test(id)) return id;
   }
   return "sandbox" in record ? sandboxIdOf(record.sandbox) : undefined;
+}
+
+function sandboxScope(stdout: string, id: string): RuntimeHandle["railwayScope"] {
+  const trimmed = stdout.trim();
+  for (const candidate of [trimmed, ...trimmed.split(/\r?\n/u).reverse()]) {
+    try {
+      const value: unknown = JSON.parse(candidate);
+      if (sandboxIdOf(value) !== id || typeof value !== "object" || value === null) continue;
+      const outer = value as Record<string, unknown>;
+      const sandbox =
+        typeof outer.sandbox === "object" &&
+        outer.sandbox !== null &&
+        sandboxIdOf(outer.sandbox) === id
+          ? (outer.sandbox as Record<string, unknown>)
+          : outer;
+      const projectId =
+        typeof sandbox.projectId === "string" && sandbox.projectId.length > 0
+          ? sandbox.projectId
+          : undefined;
+      const environmentId =
+        typeof sandbox.environmentId === "string" && sandbox.environmentId.length > 0
+          ? sandbox.environmentId
+          : undefined;
+      if (projectId !== undefined || environmentId !== undefined)
+        return {
+          ...(projectId === undefined ? {} : { projectId }),
+          ...(environmentId === undefined ? {} : { environmentId }),
+        };
+    } catch {
+      // Scope is optional. Never replace missing creation metadata with today's link.
+    }
+  }
+  return undefined;
 }
 
 export type RemoteKeyRefusalCode =
@@ -896,6 +933,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
         }
 
         sandboxId = id;
+        const railwayScope = sandboxScope(created.stdout, id);
         try {
           saveSidecar({ ...sidecar, sandboxId: id });
           const handle: RuntimeHandle = {
@@ -904,6 +942,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
             member,
             startedAt,
             ref: id,
+            ...(railwayScope === undefined ? {} : { railwayScope }),
           };
           await persistLaunch?.(handle);
           await audit(`runtime=railway sandbox=${id}`);
@@ -968,6 +1007,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
           member,
           startedAt,
           ref: id,
+          ...(railwayScope === undefined ? {} : { railwayScope }),
         };
       } finally {
         removeSignalHandlers();
@@ -991,7 +1031,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
       }
       if (outcome.code !== 0) {
         if (MISSING_FILE_PATTERN.test(outcome.stderr)) return { state: "running" };
-        if (sandboxResponseConfirms(outcome, id, "absent")) {
+        if (sandboxGone(outcome.stderr, id)) {
           await removeSidecar(home, handle.runId);
           return { state: "unknown", detail: "sandbox gone" };
         }
@@ -1030,10 +1070,18 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
       return status;
     },
 
-    async stop(handle: RuntimeHandle): Promise<void> {
+    async stop(handle: RuntimeHandle, stopOptions): Promise<void> {
       const id = sandboxRef(handle);
       if (id === undefined) throw new Error("Invalid railway runtime sandbox id.");
-      await destroySandbox(exec, id);
+      if (stopOptions?.requireSuccessfulExit === true) {
+        // An unknown worker cannot be cleared by text or the current CLI scope.
+        // Only the destroy process's successful exit confirms this stop.
+        const outcome = await exec(RAILWAY_CLI.binary, RAILWAY_CLI.destroy(id));
+        if (outcome.code !== 0)
+          throw new Error(`railway sandbox destroy ${id} failed${describeFailure(outcome, [])}`);
+      } else {
+        await destroySandbox(exec, id);
+      }
       await removeSidecar(home, handle.runId);
     },
   };
@@ -1103,47 +1151,32 @@ export async function destroyRailwaySidecar(
 /** Destroys a sandbox; a clear sandbox-scoped not-found counts as destroyed. */
 async function destroySandbox(exec: RailwayExec, id: string): Promise<void> {
   const outcome = await exec(RAILWAY_CLI.binary, RAILWAY_CLI.destroy(id));
-  if (
-    sandboxResponseConfirms(outcome, id, "destroyed") ||
-    sandboxResponseConfirms(outcome, id, "absent")
-  )
-    return;
+  if (outcome.code === 0 || sandboxGone(outcome.stderr, id)) return;
   throw new Error(`railway sandbox destroy ${id} failed${describeFailure(outcome, [])}`);
 }
 
 /**
- * Interpret the complete response, never one favorable line in isolation.
- * Existing run/sidecar formats do not bind project/environment scope, so any
- * scope claim or unknown diagnostic must refuse instead of trusting today's
- * linked scope. Every nonblank line must confirm exactly this sandbox id.
- * The success form matches Railway CLI 5.30.1; an empty successful exit is valid.
+ * Only a clear not-found for this sandbox: "sandbox not found" or "sandbox
+ * <this id> (was) not found" on one line, or a 404 line naming this id and no
+ * other scope. "sandbox <id>: project not found", another sandbox's id, or a
+ * missing command, token or environment is an error, never "gone".
  */
-function sandboxResponseConfirms(
-  outcome: RailwayExecResult,
-  id: string,
-  confirmation: "absent" | "destroyed",
-): boolean {
-  if (outcome.code === null || (confirmation === "destroyed" && outcome.code !== 0)) return false;
-  const lines = `${outcome.stdout}\n${outcome.stderr}`
-    .split(/\r?\n/u)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (confirmation === "absent" && lines.length === 0) return false;
+function sandboxGone(stderr: string, id: string): boolean {
   const escaped = id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-  const quotes = ["", "'", '"', "`"];
-  const target = `(?:${quotes.map((quote) => `${quote}(${escaped})${quote}`).join("|")})`;
-  // A trailing dot is legal in an opaque id. Only quotes disambiguate it from punctuation.
-  const terminalTarget = `(?:(${escaped})!?|${quotes
-    .slice(1)
-    .map((quote) => `${quote}(${escaped})${quote}[.!]?`)
-    .join("|")})`;
-  const message =
-    confirmation === "absent"
-      ? `(?:Error:\\s*)?(?:sandbox\\s+${target}\\s+(?:was\\s+|is\\s+)?not\\s+found[.!]?|HTTP\\s+404(?:\\s+Not\\s+Found)?\\s+for\\s+${terminalTarget})`
-      : `(?:✓\\s*)?Destroyed\\s+sandbox\\s+${terminalTarget}`;
-  const exact = new RegExp(`^${message}$`, "iu");
-  // Message words are case-insensitive, but the captured sandbox id must be literal.
-  return lines.every((line) => exact.exec(line)?.slice(1).find(Boolean) === id);
+  const notFound = new RegExp(
+    `\\bsandbox(?:\\s+["'\`]?${escaped}["'\`]?)?\\s+(?:was\\s+|is\\s+)?not\\s+found\\b`,
+    "iu",
+  );
+  const namesId = new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`, "u");
+  return stderr
+    .split(/\r?\n/u)
+    .some(
+      (line) =>
+        notFound.test(line) ||
+        (HTTP_NOT_FOUND_PATTERN.test(line) &&
+          namesId.test(line) &&
+          !OTHER_SCOPE_PATTERN.test(line.replaceAll(id, ""))),
+    );
 }
 
 async function withTimeout<T>(promise: Promise<T>, milliseconds: number): Promise<T> {

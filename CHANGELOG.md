@@ -11,18 +11,20 @@ scoped packages. The packages share one version and are released together.
 
 ### Breaking (SDK)
 
-- Railway runtime stop/status and `destroyRailwaySidecar` now require complete, case-sensitive sandbox-id confirmations across stdout and stderr. Scoped, conflicting, interrupted and id-less responses fail closed instead of clearing worker state; contradictory successful exits also refuse. No exported types, function signatures or record formats change.
+- Unknown Railway stops require destroy exit code zero; stderr warnings are accepted on success. Non-zero, interrupted and timeout outcomes reject even when text claims the sandbox was not found. Ordinary stop/status and `destroyRailwaySidecar` retain their base behavior.
+- MCP runtime `RunState` adds `orphaned` and `forgotten`; `RunRecord` and `DetachedRunSummary` add optional `forgottenAt` and `confirmedBy: "cli"`. A forgotten record requires both confirmation fields. `RuntimeHandle` adds optional `railwayScope: { projectId?, environmentId? }` for original creation metadata when available. MCP read-only run summaries include these states/confirmation fields; no forget tool is exposed.
 - `SwarmErrorCode` adds `swarm_workers_active` for active/unresolved-worker dissolution refusals. CLI JSON and MCP return that shared domain code instead of an untyped error.
-- Exported MCP `stopRun` now attempts to stop `unknown` workers and can reject when destruction cannot be confirmed; successful adapter completion is required before persisting `stopped`.
+- Exported MCP `stopRun` now attempts to stop `unknown` workers and can reject when destruction cannot be confirmed; successful adapter completion is required before persisting `stopped`. `Runtime.stop` adds an optional `{ requireSuccessfulExit: true }` argument, passed by `stopRun` for unknown Railway records; adapters must honor it without text-based absence inference.
 - MCP adds `swarm.stop` with `name` and exactly one of `runId` or `all: true`. `VapiServerOptions.runtimeForStop` optionally resolves stop-only adapters by runtime kind. The CLI-hosted server supplies local/Railway stop adapters without enabling remote startup or stale-start confirmation over MCP.
 
 ### Fixed
 
-- Railway absence detection no longer accepts a favorable line alongside project/environment, authentication, transport or timeout errors. Ambiguous stops preserve unknown records and prevent dissolution from moving funds.
-- Unknown Railway runs no longer permanently block dissolution after a sandbox disappears. CLI `swarm stop --all` and MCP `swarm.stop` attempt destruction even when status is unknown, persist `stopped` only on success or confirmed absence, and retain blocking records on stop failure. The dissolution error names both recovery commands.
+- CLI `vapi swarm forget-run <swarm> <runId> --confirm-destroyed` lets an owner confirm a verified unknown/orphaned sandbox is destroyed. It prints the original recorded scope and check command, retains a timestamped `forgotten` run record and retires the matching sidecar. Missing scope is reported rather than guessed.
+- Unknown-run recovery never infers absence from human CLI text. Only a successful destroy or explicit CLI confirmation unblocks dissolution; failures move no funds. Railway experimental warnings no longer turn successful destroys into failures.
+- Unknown Railway runs no longer permanently block dissolution after a sandbox disappears. CLI `swarm stop --all` and MCP `swarm.stop` attempt destruction even when status is unknown, persist `stopped` only after adapter success (destroy exit zero for unknown Railway runs), and retain blocking records on stop failure. The dissolution error names the applicable stop and CLI confirmation commands.
 
 - Swarm dissolution performs one shared core check before any balance lookup, pending movement resumption or transfer. CLI and MCP refresh tracked runs before that check and refuse active or unresolved Railway runs and sidecars with the same stop guidance. The core check also fails closed without a runtime adapter.
-- `SwarmCapitalDeps` adds an optional `reconcileRuns` port; local run records remain the authority for the final eligibility check. Existing lock and journal formats are unchanged.
+- `SwarmCapitalDeps` adds an optional `reconcileRuns` port; local run records remain the authority for the final eligibility check. Existing capital locks and movement-journal formats are unchanged.
 
 ## 0.12.0 — 2026-10-30
 
