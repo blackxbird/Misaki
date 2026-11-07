@@ -669,52 +669,28 @@ async function recoverPendingPurchaseLocked(
   await deps.wallets.refreshRegistry();
   let pending = deps.wallets.snapshot().wallets[deps.wallet]?.routerPendingPurchase;
   if (pending === undefined) return undefined;
-  const recorded = await purchaseReceipt(deps, pending, receiptsPath).catch(() => undefined);
-  if (pending.status === "prepared" && (recorded === undefined || definitelyUnpaid(recorded))) {
+  const resolution = await resolveRouterPendingPurchase(deps, pending, {
+    ...(receiptsPath === undefined ? {} : { receiptsPath }),
+    ...(config === undefined ? {} : { config }),
+    ...(now === undefined ? {} : { now }),
+  });
+  if (resolution.state === "unpaid") {
     await deps.wallets.setRouterPendingPurchase(deps.wallet, null, pending.receiptId);
     return undefined;
   }
-  if (pending.status === "signed" && recorded?.settlement?.outcome !== "succeeded") {
-    try {
-      const recoveryConfig =
-        config ?? deps.refill?.config ?? (await loadConfig(getVapiPaths(deps.wallets.home).config));
-      const used = await authorizationUsed(deps, pending, recoveryConfig);
-      if (used) {
-        pending = { ...pending, status: "settled" };
-        await deps.wallets.setRouterPendingPurchase(deps.wallet, pending, pending.receiptId);
-      } else {
-        const expires = BigInt(pending.authorization!.validBefore) + 30n;
-        const clock =
-          now ??
-          (typeof deps.refill?.now === "function" ? deps.refill.now() : deps.refill?.now) ??
-          new Date();
-        if (BigInt(Math.floor(clock.getTime() / 1000)) > expires) {
-          await deps.wallets.setRouterPendingPurchase(deps.wallet, null, pending.receiptId);
-          return undefined;
-        }
-        const resolvesAt = new Date(Number(expires + 1n) * 1000).toISOString();
-        throw new RouterClientError(
-          "refill_pending",
-          `The Router authorization can still settle. Retry after ${resolvesAt} to check its nonce; do not repeat the purchase.`,
-          undefined,
-          { receipt: pendingReceipt(deps, pending), balance: null },
-        );
-      }
-    } catch (error) {
-      if (error instanceof RouterClientError) throw error;
-      throw unresolvedPurchaseError(deps, pending);
-    }
+  if (resolution.state === "waiting") {
+    throw new RouterClientError(
+      "refill_pending",
+      `The Router authorization can still settle. Retry after ${resolution.resolvesAt} to check its nonce; do not repeat the purchase.`,
+      undefined,
+      { receipt: pendingReceipt(deps, pending), balance: null },
+    );
   }
-  const purchase: RouterPurchaseResult = {
-    receipt:
-      recorded?.settlement?.outcome === "succeeded" ? recorded : pendingReceipt(deps, pending),
-    balance: null,
-  };
-  if (purchase.receipt.settlement?.outcome !== "succeeded") {
-    throw unresolvedPurchaseError(deps, pending);
-  }
+  if (resolution.state === "unavailable") throw unresolvedPurchaseError(deps, pending);
+  const purchase: RouterPurchaseResult = { receipt: resolution.receipt, balance: null };
   pending = settledPendingPurchase(pending, purchase.receipt);
   try {
+    await deps.wallets.setRouterPendingPurchase(deps.wallet, pending, pending.receiptId);
     const link = await linkedWallet(deps);
     if (!sameAgentLink(link, pending.link)) {
       throw new RouterClientError("http", "The agent link changed after the Router purchase.");
@@ -725,6 +701,50 @@ async function recoverPendingPurchaseLocked(
   } catch (error) {
     throw pendingPurchaseError(purchase, false, error);
   }
+}
+
+export type RouterPendingResolution =
+  | { state: "unpaid" }
+  | { state: "settled"; receipt: Receipt }
+  | { state: "waiting"; resolvesAt: string }
+  | { state: "unavailable" };
+
+/** Shared authoritative check for recovery and CLI clearing. Caller holds the purchase lock. */
+export async function resolveRouterPendingPurchase(
+  deps: RouterClientDeps,
+  pending: RouterPendingPurchase,
+  options: { receiptsPath?: string; config?: VapiConfig; now?: Date } = {},
+): Promise<RouterPendingResolution> {
+  const recorded = await purchaseReceipt(deps, pending, options.receiptsPath).catch(
+    () => undefined,
+  );
+  // A receipt takes precedence over both the journal state and the chain check.
+  if (recorded?.settlement?.outcome === "succeeded") return { state: "settled", receipt: recorded };
+  if (pending.status === "settled")
+    return { state: "settled", receipt: pendingReceipt(deps, pending) };
+  if (pending.status === "prepared" && (recorded === undefined || definitelyUnpaid(recorded)))
+    return { state: "unpaid" };
+  if (pending.authorization === undefined || pending.network === undefined)
+    return { state: "unavailable" };
+  let used: boolean;
+  try {
+    const config =
+      options.config ??
+      deps.refill?.config ??
+      (await loadConfig(getVapiPaths(deps.wallets.home).config));
+    used = await authorizationUsed(deps, pending, config);
+  } catch {
+    return { state: "unavailable" };
+  }
+  if (used)
+    return { state: "settled", receipt: pendingReceipt(deps, { ...pending, status: "settled" }) };
+  const expires = BigInt(pending.authorization.validBefore) + 30n;
+  const clock =
+    options.now ??
+    (typeof deps.refill?.now === "function" ? deps.refill.now() : deps.refill?.now) ??
+    new Date();
+  if (BigInt(Math.floor(clock.getTime() / 1000)) > expires) return { state: "unpaid" };
+  return { state: "waiting", resolvesAt: new Date(Number(expires + 1n) * 1000).toISOString() };
 }
 
 const authorizationStateAbi = [

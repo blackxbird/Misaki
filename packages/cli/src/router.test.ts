@@ -8,6 +8,8 @@ import {
   SpendCapError,
   SpendCapExceededError,
   getDefaultConfig,
+  appendReceipt,
+  getVapiPaths,
   drainCeilingSweeps,
   type Receipt,
   type SecretStore,
@@ -66,6 +68,115 @@ describe("vapi router models", () => {
 });
 
 describe("vapi router clear-pending", () => {
+  it.each([
+    "receipt",
+    "settled",
+    "used",
+    "live",
+    "margin",
+    "expired",
+    "rpc-error",
+    "unsupported",
+    "prepared",
+  ] as const)("resolves %s evidence before an explicit clear", async (state) => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    const now = new Date("2026-11-07T10:00:00.000Z");
+    const config = getDefaultConfig({});
+    // Explicit fixture networks keep the test independent of operator RPC settings.
+    config.networks["eip155:5042"] = {
+      rpcUrl: "https://rpc.example",
+      usdc: "0x3600000000000000000000000000000000000000",
+    };
+    await writeFile(join(home, "config.json"), JSON.stringify(config));
+    const validBefore =
+      Math.floor(now.getTime() / 1000) + (state === "live" ? 120 : state === "margin" ? -5 : -120);
+    const pending = {
+      receiptId: `clear-${state}`,
+      status:
+        state === "prepared"
+          ? ("prepared" as const)
+          : state === "settled"
+            ? ("settled" as const)
+            : ("signed" as const),
+      createdAt: now.toISOString(),
+      tierUsd: 5 as const,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "public-client",
+        owner: "0x1111111111111111111111111111111111111111" as const,
+        label: "test",
+        scopes: [],
+        linkedAt: now.toISOString(),
+      },
+      network: state === "unsupported" ? "eip155:999999" : "eip155:5042",
+      ...(state === "prepared"
+        ? {}
+        : {
+            authorization: {
+              token: config.networks["eip155:5042"]!.usdc,
+              from: "0x1111111111111111111111111111111111111111",
+              nonce: `0x${"ab".repeat(32)}`,
+              validBefore: String(validBefore),
+            },
+          }),
+    };
+    await store.setRouterPendingPurchase(WALLET, pending);
+    if (state === "receipt")
+      await appendReceipt(
+        {
+          id: pending.receiptId,
+          timestamp: now.toISOString(),
+          wallet: WALLET,
+          resourceUrl: "https://console.example/api/router/top-up/5",
+          method: "POST",
+          outcome: "paid",
+          settlement: { outcome: "succeeded", transaction: `0x${"33".repeat(32)}` },
+        },
+        getVapiPaths(home).receipts,
+        { wallet: WALLET },
+      );
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const body = (await request.json()) as {
+        id: number;
+        method: string;
+        params: [{ to: string; data: string }];
+      };
+      expect(body.method).toBe("eth_call");
+      expect(body.params[0].to).toBe(pending.authorization!.token);
+      expect(body.params[0].data).toContain(pending.authorization!.nonce.slice(2));
+      if (state === "rpc-error") throw new Error("RPC unavailable");
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: `0x${(state === "used" ? "1" : "0").padStart(64, "0")}`,
+      });
+    });
+    const captured = captureIo();
+    const exit = await runCli(
+      ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+      captured.io,
+      commandDependencies({ fetchImpl, now: () => now }),
+    );
+    const refuses = ["receipt", "settled", "used", "live", "margin"].includes(state);
+    expect(exit).toBe(refuses ? 1 : 0);
+    expect(fetchImpl).toHaveBeenCalledTimes(
+      ["used", "live", "margin", "expired", "rpc-error"].includes(state) ? 1 : 0,
+    );
+    const retained = (await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase;
+    expect(retained?.receiptId).toBe(refuses ? pending.receiptId : undefined);
+    expect(captured.stdout).toHaveLength(1);
+    const output = JSON.parse(captured.stdout[0]!);
+    if (["receipt", "settled", "used"].includes(state))
+      expect(output.error).toMatch(/payment settled.*retry chat.*key/iu);
+    if (state === "live" || state === "margin")
+      expect(output.error).toContain(new Date((validBefore + 31) * 1000).toISOString());
+    if (state === "rpc-error" || state === "unsupported")
+      expect(output.confirmation).toMatch(/human confirmed.*without chain evidence/iu);
+    else if (!refuses) expect(output.confirmation).toBeUndefined();
+  });
+
   it("emits only one JSON error when the confirmed clear cannot be persisted", async () => {
     const home = await initializedHome();
     const store = await WalletStore.open(home);
@@ -134,7 +245,9 @@ describe("vapi router clear-pending", () => {
     };
     await store.setRouterPendingPurchase(WALLET, pending);
     const human = captureIo();
-    const dependencies = commandDependencies();
+    const dependencies = commandDependencies({
+      fetchImpl: vi.fn<typeof fetch>().mockRejectedValue(new Error("RPC offline")),
+    });
     expect(
       await runCli(["router", "clear-pending", "--account", WALLET], human.io, dependencies),
     ).toBe(0);
