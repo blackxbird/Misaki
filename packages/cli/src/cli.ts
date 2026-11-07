@@ -263,6 +263,7 @@ Usage:
   vapi router buy --auto <1|5|20|50> --below <usd> [--account <name>] [--json]
   vapi router buy --auto off [--account <name>] [--json]
   vapi router key [--rotate] [--account <name>] [--json]
+  vapi router clear-pending [--confirm-unpaid] [--account <name>] [--json]
   vapi stake status [--account <name>] [--json]
   vapi stake open [--account <name>] [--no-browser] [--json]
   vapi task search [--open] [--min <usd>] [--tab trending|new|closing|paid] [--limit <n>] [--json]

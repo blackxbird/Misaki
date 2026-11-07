@@ -26,6 +26,7 @@ import {
   X402Error,
   type X402NetworkConfig,
   type X402Quote,
+  type X402SigningEvidence,
   type X402SettlementOutcome,
 } from "./x402.js";
 
@@ -45,6 +46,8 @@ export type PayRequestArgs = {
   receiptId?: string;
   now?: Date;
   allowanceExpiresAt?: Date;
+  /** Must finish durable journaling before the signer is invoked. */
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
   nowMs?: () => number;
   source?: string;
   lookup?: LookupFn;
@@ -134,6 +137,8 @@ export type CompleteX402PaymentArgs<T = undefined> = {
   paymentId?: string;
   now?: Date;
   allowanceExpiresAt?: Date;
+  /** Must finish durable journaling before the signer is invoked. */
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
   nowMs?: () => number;
   quoteStartedMs?: number;
   trace?: X402PaymentTrace;
@@ -225,6 +230,7 @@ export async function payRequest(input: PayRequestArgs): Promise<PayRequestResul
           : { allowanceExpiresAt: args.allowanceExpiresAt }),
         nowMs,
         trace,
+        ...(args.beforeSign === undefined ? {} : { beforeSign: args.beforeSign }),
         ...(args.runBudget === undefined ? {} : { runBudget: args.runBudget }),
         ...(args.ceilingSweep === undefined ? {} : { ceilingSweep: args.ceilingSweep }),
       });
@@ -403,6 +409,7 @@ export async function completeX402Payment<T = undefined>(
     payment = await buildCompatibleX402Payment({
       account: args.account,
       quote,
+      ...(args.beforeSign === undefined ? {} : { beforeSign: args.beforeSign }),
       fetchImpl:
         args.fetchImpl ??
         createPublicFetch({

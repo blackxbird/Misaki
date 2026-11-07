@@ -65,6 +65,103 @@ describe("vapi router models", () => {
   });
 });
 
+describe("vapi router clear-pending", () => {
+  it("emits only one JSON error when the confirmed clear cannot be persisted", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    await store.setRouterPendingPurchase(WALLET, {
+      receiptId: "clear-write-failure",
+      status: "unknown",
+      createdAt: "2026-09-23T10:00:00.000Z",
+      tierUsd: 5,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "client",
+        owner: "0x1111111111111111111111111111111111111111",
+        label: "test",
+        scopes: [],
+        linkedAt: "2026-09-23T10:00:00.000Z",
+      },
+    });
+    const failure = vi
+      .spyOn(WalletStore.prototype, "setRouterPendingPurchase")
+      .mockRejectedValue(new Error("pending file is read-only"));
+    try {
+      const captured = captureIo();
+      expect(
+        await runCli(
+          ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+          captured.io,
+          commandDependencies(),
+        ),
+      ).toBe(1);
+      expect(captured.stdout).toHaveLength(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        error: "pending file is read-only",
+        exitCode: 1,
+      });
+    } finally {
+      failure.mockRestore();
+    }
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase?.receiptId).toBe(
+      "clear-write-failure",
+    );
+  });
+
+  it("prints public evidence without clearing, then requires explicit unpaid confirmation", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    const pending = {
+      receiptId: "manual-recovery",
+      status: "unknown" as const,
+      createdAt: "2026-09-23T10:00:00.000Z",
+      tierUsd: 5 as const,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "public-client",
+        owner: `0x${"11".repeat(20)}` as const,
+        label: "test",
+        scopes: [],
+        linkedAt: "2026-09-23T10:00:00.000Z",
+      },
+      network: "eip155:8453",
+      authorization: {
+        token: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        from: `0x${"11".repeat(20)}`,
+        nonce: `0x${"ab".repeat(32)}`,
+        validBefore: "1790157600",
+      },
+    };
+    await store.setRouterPendingPurchase(WALLET, pending);
+    const human = captureIo();
+    const dependencies = commandDependencies();
+    expect(
+      await runCli(["router", "clear-pending", "--account", WALLET], human.io, dependencies),
+    ).toBe(0);
+    expect(human.stdout.join("\n")).toContain(pending.authorization.nonce);
+    expect(human.stdout.join("\n")).toContain("https://basescan.org/address/");
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase).toEqual(pending);
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      wallet: WALLET,
+      cleared: true,
+      pending: {
+        receiptId: pending.receiptId,
+        authorization: pending.authorization,
+        instructions: expect.stringContaining("authorizationState"),
+      },
+    });
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase).toBeUndefined();
+  });
+});
+
 describe("vapi router usage", () => {
   it("prints the Compute allowance and preserves the usage object as JSON", async () => {
     await initializedHome();
@@ -818,7 +915,7 @@ describe("Router client errors", () => {
 
     expect(await runCli(["router", "--json"], captured.io, commandDependencies())).toBe(2);
     expect(JSON.parse(captured.stdout[0]!)).toEqual({
-      error: "Usage: vapi router <models|usage|chat|key|buy>.",
+      error: "Usage: vapi router <models|usage|chat|key|buy|clear-pending>.",
       exitCode: 2,
     });
   });

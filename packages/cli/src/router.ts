@@ -16,6 +16,7 @@ import {
   routerCredentials,
   routerUsage,
   routerPurchaseView,
+  routerPendingEvidence,
   type RouterClientDeps,
   type RouterTopupTier,
 } from "@vapi-network/core/router-client";
@@ -61,12 +62,60 @@ export async function routerCommand(
     case "buy":
       await buyCommand(argv.slice(1), json, io, dependencies);
       return;
+    case "clear-pending":
+      await clearPendingCommand(argv.slice(1), json, io, dependencies);
+      return;
     case "key":
       await keyCommand(argv.slice(1), json, io, dependencies);
       return;
     default:
-      throw new UsageError("Usage: vapi router <models|usage|chat|key|buy>.");
+      throw new UsageError("Usage: vapi router <models|usage|chat|key|buy|clear-pending>.");
   }
+}
+
+async function clearPendingCommand(
+  argv: string[],
+  json: boolean,
+  io: CliIo,
+  dependencies: CliDependencies,
+): Promise<void> {
+  const parsed = parseArguments(argv, {
+    valueOptions: new Set([WALLET_OPTION]),
+    booleanOptions: new Set(["--confirm-unpaid"]),
+    maximumPositionals: 0,
+  });
+  const target = await targetWallet(parsed, dependencies);
+  await target.store.withRouterPurchaseLock(target.name, async () => {
+    await target.store.refreshRegistry();
+    const pending = target.store.entry(target.name)?.routerPendingPurchase;
+    const evidence = pending === undefined ? null : routerPendingEvidence(pending);
+    const confirmed = parsed.has("--confirm-unpaid");
+    if (confirmed && pending?.status === "settled") {
+      throw new Error(
+        "Payment settled. Retry chat to recover its Router key; this purchase cannot be confirmed unpaid.",
+      );
+    }
+    if (confirmed && pending !== undefined) {
+      await target.store.setRouterPendingPurchase(target.name, null, pending.receiptId);
+    }
+    if (json)
+      io.stdout(
+        JSON.stringify({
+          wallet: target.name,
+          pending: evidence,
+          cleared: confirmed && pending !== undefined,
+        }),
+      );
+    else if (evidence === null) io.stdout("No pending Router purchase.");
+    else {
+      io.stdout(JSON.stringify(evidence, null, 2));
+      io.stdout(
+        confirmed
+          ? "Confirmed unpaid; cleared the pending Router purchase."
+          : "After verifying this payment cannot settle, run vapi router clear-pending --confirm-unpaid with the same account.",
+      );
+    }
+  });
 }
 
 async function modelsCommand(
