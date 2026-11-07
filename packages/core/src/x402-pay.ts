@@ -250,7 +250,7 @@ export async function payRequest(input: PayRequestArgs): Promise<PayRequestResul
         trace,
         receiptId,
         startedAt,
-        elapsed(nowMs, startedMs),
+        safeElapsed(nowMs, startedMs),
         {
           outcome: paymentErrorOutcome(safeError),
           error: { code: errorCode(safeError), message: receiptSafeErrorMessage(safeError) },
@@ -465,7 +465,7 @@ export async function completeX402Payment<T = undefined>(
   try {
     paidAttempt = await args.send(paidRequest, quote);
   } catch (error) {
-    if (trace) trace.phases.requestMs = elapsed(nowMs, requestStarted);
+    if (trace) trace.phases.requestMs = safeElapsed(nowMs, requestStarted);
     throw settlementUnknown(
       "The paid request lost its response. Do not retry automatically; inspect the authorization and settlement state first.",
       quote,
@@ -475,12 +475,12 @@ export async function completeX402Payment<T = undefined>(
       sanitizeThrownError(error, receiptSecrets),
     );
   }
-  if (trace) trace.phases.requestMs = elapsed(nowMs, requestStarted);
 
   const paidResponse = paidAttempt.response;
   if (trace) trace.status = paidResponse.status;
-  const settleStarted = nowMs();
+  // Capture financial evidence before reading any caller-controlled timing clock.
   const settlement = parseSettlementResponse(paidResponse.headers);
+  const settleStarted = safeClock(nowMs);
   const settlementOutcome = classifySettlement(settlement);
   const receiptSettlement = sanitizeReturnedValue(settlement, receiptSecrets);
   if (trace) {
@@ -494,7 +494,8 @@ export async function completeX402Payment<T = undefined>(
       ...(explorerUrl ? { explorerUrl } : {}),
       ...(receiptSettlement === null ? {} : { evidence: receiptSettlement }),
     };
-    trace.phases.settleMs = elapsed(nowMs, settleStarted);
+    trace.phases.requestMs = safeElapsed(nowMs, requestStarted);
+    trace.phases.settleMs = safeElapsed(nowMs, settleStarted);
   }
 
   try {
@@ -541,7 +542,7 @@ export async function completeX402Payment<T = undefined>(
 
     let body: T | undefined;
     if (args.consumeResponse) {
-      const bodyStarted = nowMs();
+      const bodyStarted = safeClock(nowMs);
       try {
         body = await args.consumeResponse(paidResponse);
       } catch (error) {
@@ -562,7 +563,7 @@ export async function completeX402Payment<T = undefined>(
         );
       } finally {
         if (trace) {
-          trace.phases.requestMs = (trace.phases.requestMs ?? 0) + elapsed(nowMs, bodyStarted);
+          trace.phases.requestMs = (trace.phases.requestMs ?? 0) + safeElapsed(nowMs, bodyStarted);
         }
       }
       body = sanitizeReturnedValue(body, receiptSecrets) as T;
@@ -1074,6 +1075,24 @@ function settlementTransaction(value: unknown): string | undefined {
 
 function isRedirectStatus(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function safeClock(nowMs: () => number): number {
+  try {
+    const now = nowMs();
+    return Number.isFinite(now) ? now : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function safeElapsed(nowMs: () => number, started: number): number {
+  try {
+    const duration = elapsed(nowMs, started);
+    return Number.isFinite(duration) ? duration : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function elapsed(nowMs: () => number, started: number): number {

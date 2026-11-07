@@ -140,6 +140,40 @@ describe("payRequest", () => {
     expect((await readReceipts(localPaths.receiptsPath))[0]?.id).toBe(result.receipt.id);
   });
 
+  it("keeps evidence when the clock throws immediately after the settled response", async () => {
+    const localPaths = await paths();
+    let responded = false;
+    const fetchImpl = vi.fn<typeof fetch>(async () => {
+      if (fetchImpl.mock.calls.length === 1) return paymentRequired();
+      responded = true;
+      return paidResponse();
+    });
+    const result = await payRequest({
+      url: "https://vendor.example/paid",
+      init: { method: "POST" },
+      account: privateKeyToAccount(PRIVATE_KEY),
+      wallet: "main",
+      caps: { perCallAtomic: "10000", perDayAtomic: "10000" },
+      config: getDefaultConfig(),
+      fetchImpl,
+      paths: localPaths,
+      now: NOW,
+      nowMs: () => {
+        if (responded) throw new Error("clock unavailable after response");
+        return 0;
+      },
+      lookup: async () => ["93.184.216.34"],
+    });
+    expect(result.receipt.settlement).toMatchObject({
+      outcome: "succeeded",
+      transaction: `0x${"33".repeat(32)}`,
+    });
+    expect((await readReceipts(localPaths.receiptsPath))[0]?.settlement).toEqual(
+      result.receipt.settlement,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it("validates receipt metadata before sending a payment", async () => {
     const localPaths = await paths();
     const fetchImpl = vi
