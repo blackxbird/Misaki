@@ -8,6 +8,7 @@ import {
   SpendCapError,
   SpendCapExceededError,
   getDefaultConfig,
+  drainCeilingSweeps,
   type Receipt,
   type SecretStore,
   WalletStore,
@@ -38,6 +39,7 @@ let activeSecretStore: SecretStore | undefined;
 let activeSecretEntries: Record<string, string> | undefined;
 
 afterEach(async () => {
+  await drainCeilingSweeps();
   restoreEnvironment("VAPI_HOME", originalHome);
   activeSecretStore = undefined;
   activeSecretEntries = undefined;

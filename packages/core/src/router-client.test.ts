@@ -13,6 +13,7 @@ import {
   type AgentTokens,
 } from "./agent-link.js";
 import { readAuditLog } from "./audit.js";
+import { drainCeilingSweeps } from "./ceiling.js";
 import { DEFAULT_SPEND_CAPS, getDefaultConfig } from "./config.js";
 import { NETWORKS } from "./networks.js";
 import { readReceipts } from "./receipts.js";
@@ -52,6 +53,7 @@ const directories: string[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
+  await drainCeilingSweeps();
   vi.restoreAllMocks();
   await Promise.all(
     directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),

@@ -4,6 +4,8 @@ import { resolve } from "node:path";
 import { withAccountMovementLocks } from "./account-movement-lock.js";
 import { listUnfinishedMovements, readMovement } from "./movement.js";
 import { listSwarms, swarmAccountNames, SwarmError, withSwarmLock } from "./swarm.js";
+import { resolveSenderOwnership } from "./swarm-sender.js";
+import { WalletStore } from "./wallet-store.js";
 import { walletNameSchema } from "./wallet-name.js";
 
 export type CapitalLockRequest = {
@@ -101,6 +103,7 @@ export async function withCapitalLocks<T>(
   const accounts = new Set(request.accounts ?? []);
   if (!request.metadataOnly) {
     const known = await listSwarms(home);
+    const store = await WalletStore.open(home);
     const movements = await Promise.all(
       (await listUnfinishedMovements({ home })).map(
         async (item) => await readMovement(home, item.id),
@@ -111,11 +114,13 @@ export async function withCapitalLocks<T>(
       previous = `${[...swarms].sort()}|${[...accounts].sort()}`;
       for (const swarm of known) {
         const members = swarmAccountNames(swarm);
-        if (swarms.has(swarm.name) || members.some((account) => accounts.has(account))) {
-          swarms.add(swarm.name);
+        if (swarms.has(swarm.name)) {
           for (const account of members) accounts.add(account);
         }
       }
+      const ownership = await resolveSenderOwnership(store, { accounts: [...accounts] });
+      for (const alias of ownership.accounts) accounts.add(alias);
+      for (const swarm of ownership.swarms) swarms.add(swarm.name);
       for (const movement of movements) {
         if (!movement.legs.some((leg) => accounts.has(leg.from) || accounts.has(leg.to))) continue;
         for (const leg of movement.legs) {

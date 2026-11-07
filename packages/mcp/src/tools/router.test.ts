@@ -2,7 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { WalletStore, getDefaultConfig, type Receipt, type SecretStore } from "@vapi-network/core";
+import {
+  WalletStore,
+  getDefaultConfig,
+  drainCeilingSweeps,
+  type Receipt,
+  type SecretStore,
+} from "@vapi-network/core";
 import {
   RouterClientError,
   type AgentRouterUsage,
@@ -22,6 +28,7 @@ const FORBIDDEN_FIELDS = new Set(["key", "apiKey", "secret"]);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  await drainCeilingSweeps();
   vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories

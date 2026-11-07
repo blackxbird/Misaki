@@ -921,6 +921,7 @@ async function callTransfer(
       expectedToAddress: leg.toAddress,
       ...(sweepParent === undefined ? {} : { sweepParent }),
       home: deps.home ?? deps.store.home,
+      movementId: movement.id,
       ...(resume ? { resume: leg.nonce as Hex } : { nonce: leg.nonce as Hex }),
       ...(deps.unlock === undefined ? {} : { unlock: deps.unlock }),
       ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),

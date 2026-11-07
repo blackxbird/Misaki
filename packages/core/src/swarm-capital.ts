@@ -1088,8 +1088,6 @@ async function dissolveSwarmLocked(
   const swarm = await readSwarm(home, opts.name);
   await deps.reconcileRuns?.({ home, name: swarm.name });
   await assertSwarmWorkersStopped(home, swarm);
-  swarm.dissolving = true;
-  await writeSwarm(home, swarm);
   await assertSwarmAccountAddresses(swarm, deps);
   await reconcilePendingCeilingSweeps(swarm, swarmAccountNames(swarm), deps, home);
   const resumed = await resumeOrBlock(swarm, deps, home);
@@ -1100,6 +1098,11 @@ async function dissolveSwarmLocked(
       message: resumedMessage(resumed.movementId),
     };
   }
+
+  // Resuming pre-existing work returns without starting dissolution. Record
+  // intent only when the first dissolution sweep is about to be prepared.
+  swarm.dissolving = true;
+  await writeSwarm(home, swarm);
 
   const balanceReader = await capitalBalanceReader(swarm, deps, home);
   const memberBalances = await Promise.all(

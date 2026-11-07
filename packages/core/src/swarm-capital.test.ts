@@ -1480,9 +1480,10 @@ describe("dissolving a swarm", () => {
     { intent: false, worker: true, blocked: true },
     { intent: false, worker: false, blocked: false },
   ])(
-    "guards unresolved sweep sender ownership ($intent, $worker)",
+    "guards addressless members matched by wallet key reference ($intent, $worker)",
     async ({ intent, worker, blocked }) => {
       const fixture = await capitalFixture();
+      await fixture.store.importKey("team-helper-2", "", `0x${"12".repeat(32)}`);
       await writeRawSwarm(fixture.home, {
         ...fixture.swarm,
         ...(intent ? { dissolving: true as const } : {}),
@@ -1534,12 +1535,53 @@ describe("dissolving a swarm", () => {
       );
       if (blocked) {
         await expect(operation).rejects.toThrow(
-          worker ? "vapi swarm stop team --all" : "Cannot resolve the sweep sender",
+          worker ? "vapi swarm stop team --all" : "has dissolve intent",
         );
         expect(transport).not.toHaveBeenCalled();
       } else {
         await expect(operation).resolves.toMatchObject({ amountAtomic: "1000000" });
         expect(transport).toHaveBeenCalledOnce();
+      }
+    },
+  );
+
+  it.each(["matching", "unbound", "nonce", "amount", "network", "purpose", "terminal"] as const)(
+    "checks durable dissolution leg permission at the executor (%s)",
+    async (change) => {
+      const fixture = await capitalFixture();
+      fixture.balances.set("team-lead-1", 1_000_000n);
+      fixture.transfer.mockImplementationOnce(async (args) => transferResult(args, "unknown"));
+      const initial = await dissolveSwarm({ name: "team" }, fixture.deps);
+      const id = initial.movements[0]!.movementId;
+      const movement = await readMovement(fixture.home, id);
+      const leg = movement.legs[0]!;
+      if (change === "terminal")
+        await writeFile(
+          join(fixture.home, "movements", `${id}.json`),
+          JSON.stringify({ ...movement, legs: [{ ...leg, status: "sent" }] }),
+        );
+      fixture.transfer.mockClear();
+      const operation = executeTransfer(
+        {
+          store: fixture.store,
+          secrets: fixture.deps.secrets,
+          apiBase: API_BASE,
+          from: leg.from,
+          to: leg.to,
+          amountUsd: change === "amount" ? 2 : leg.amountUsd,
+          purpose: change === "purpose" ? "send" : "sweep",
+          network: change === "network" ? ARC_MAINNET_CAIP2 : movement.network,
+          nonce: change === "nonce" ? `0x${"ee".repeat(32)}` : (leg.nonce as Hex),
+          ...(change === "unbound" ? {} : { movementId: id }),
+        },
+        fixture.transfer,
+      );
+      if (change === "matching") {
+        await expect(operation).resolves.toMatchObject({ status: "sent" });
+        expect(fixture.transfer).toHaveBeenCalledOnce();
+      } else {
+        await expect(operation).rejects.toThrow("has dissolve intent");
+        expect(fixture.transfer).not.toHaveBeenCalled();
       }
     },
   );
@@ -1850,7 +1892,8 @@ describe("dissolving a swarm", () => {
       status: "resumed",
       movements: [{ movementId, complete: true }],
     });
-    await expect(readSwarm(fixture.home, "team")).resolves.toBeDefined();
+    await expect(readSwarm(fixture.home, "team")).resolves.toMatchObject({ name: "team" });
+    expect((await readSwarm(fixture.home, "team")).dissolving).toBeUndefined();
   });
 
   it("sweeps members to treasury, sweeps treasury to owner, and preserves accounts and profiles", async () => {

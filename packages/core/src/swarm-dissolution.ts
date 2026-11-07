@@ -2,7 +2,7 @@ import { listUnfinishedMovements, readMovement, type Movement } from "./movement
 import { readSwarm, type SwarmFile } from "./swarm.js";
 
 /** Legacy member legs need no per-call classification: recorded intent guards every outgoing leg. */
-function recordsDissolveIntent(movement: Movement, swarm: SwarmFile): boolean {
+export function isSwarmDissolutionMovement(movement: Movement, swarm: SwarmFile): boolean {
   return (
     movement.dissolution === swarm.name ||
     (movement.reason === "sweep" &&
@@ -21,7 +21,7 @@ export async function hasSwarmDissolveIntent(home: string, name: string): Promis
   const swarm = await readSwarm(home, name);
   if (swarm.dissolving === true) return true;
   for (const summary of await listUnfinishedMovements({ home })) {
-    if (recordsDissolveIntent(await readMovement(home, summary.id), swarm)) return true;
+    if (isSwarmDissolutionMovement(await readMovement(home, summary.id), swarm)) return true;
   }
   return false;
 }
