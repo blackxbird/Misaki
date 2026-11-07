@@ -2105,6 +2105,185 @@ describe("railway runtime create failures", () => {
 });
 
 describe("railway runtime sandbox-gone detection", () => {
+  const responses = [
+    ["ambiguous unquoted id punctuation", "", `HTTP 404 for ${SANDBOX_ID}.`, false, 1],
+    ["unambiguous quoted id punctuation", "", `HTTP 404 for '${SANDBOX_ID}'.`, true, 1],
+    ["case-mismatched not-found id", "", `sandbox ${SANDBOX_ID.toUpperCase()} not found`, false, 1],
+    ["case-mismatched 404 id", "", `HTTP 404 for ${SANDBOX_ID.toUpperCase()}`, false, 1],
+    [
+      "wrong project suffix",
+      "",
+      `sandbox ${SANDBOX_ID} not found in project wrong-project`,
+      false,
+      1,
+    ],
+    ["environment suffix", "", `sandbox ${SANDBOX_ID} not found in environment other`, false, 1],
+    [
+      "404 plus conflicting line",
+      "",
+      `HTTP 404 for ${SANDBOX_ID}\nError: environment not found`,
+      false,
+      1,
+    ],
+    [
+      "conflict before proof",
+      "",
+      `Error: environment not found\nHTTP 404 for ${SANDBOX_ID}`,
+      false,
+      1,
+    ],
+    ["stdout scope conflict", "Error: project not found", `HTTP 404 for ${SANDBOX_ID}`, false, 1],
+    [
+      "stderr scope conflict",
+      `HTTP 404 for ${SANDBOX_ID}`,
+      "Error: environment not found",
+      false,
+      1,
+    ],
+    [
+      "stdout auth conflict",
+      "Error: unauthorized (401)",
+      `sandbox ${SANDBOX_ID} not found`,
+      false,
+      1,
+    ],
+    [
+      "stdout transport conflict",
+      "Error: network error",
+      `sandbox ${SANDBOX_ID} not found`,
+      false,
+      1,
+    ],
+    ["timeout conflict", `sandbox ${SANDBOX_ID} not found`, "request timed out", false, 1],
+    [
+      "other sandbox conflict",
+      `sandbox ${SANDBOX_ID} not found`,
+      "sandbox other-id not found",
+      false,
+      1,
+    ],
+    ["token conflict", "Error: token expired", `HTTP 404 for ${SANDBOX_ID}`, false, 1],
+    [
+      "unverifiable named scope",
+      "Project: original-project",
+      `sandbox ${SANDBOX_ID} not found`,
+      false,
+      1,
+    ],
+    ["clean exact id", "", `sandbox ${SANDBOX_ID} not found`, true, 1],
+    ["clean stdout exact id", `sandbox ${SANDBOX_ID} not found`, "", true, 1],
+    [
+      "clean punctuation and whitespace",
+      "  ",
+      `  Error: sandbox '${SANDBOX_ID}' was not found.\r\n`,
+      true,
+      1,
+    ],
+    [
+      "consistent streams",
+      `sandbox ${SANDBOX_ID} not found`,
+      `HTTP 404 for ${SANDBOX_ID}`,
+      true,
+      1,
+    ],
+    ["another id", "", "sandbox another-id not found", false, 1],
+    ["no exact id", "", "sandbox not found", false, 1],
+    ["timeout", "", "request timed out", false, 1],
+    ["401", "", "HTTP 401 Unauthorized", false, 1],
+    ["network failure", "", "network error: connection reset", false, 1],
+    ["unknown extra line", "try a different project", `sandbox ${SANDBOX_ID} not found`, false, 1],
+    ["interrupted process", "", `sandbox ${SANDBOX_ID} not found`, false, null],
+  ] as const;
+  it.each(
+    responses.flatMap(([label, stdout, stderr, gone, code]) =>
+      (["stop", "status", "sidecar"] as const).map((route) => ({
+        label,
+        stdout,
+        stderr,
+        gone,
+        code,
+        route,
+      })),
+    ),
+  )(
+    "requires whole-response absence proof ($route: $label)",
+    async ({ stdout, stderr, gone, code, route }) => {
+      const home = await mkdtemp(join(tmpdir(), "vapi-railway-proof-"));
+      homes.push(home);
+      await mkdir(runsDirectory(home), { recursive: true });
+      const path = railwaySidecarPath(home, RUN_ID);
+      await writeFile(path, JSON.stringify(sidecarOf({ state: "running", sandboxId: SANDBOX_ID })));
+      const response: RailwayExecResult = { code, stdout, stderr };
+      const exec = vi.fn<RailwayExec>(async () => response);
+      const runtime = createRailwayRuntime({ home, exec });
+      if (route === "stop") {
+        if (gone) await expect(runtime.stop(handle())).resolves.toBeUndefined();
+        else
+          await expect(runtime.stop(handle())).rejects.toThrow(
+            `railway sandbox destroy ${SANDBOX_ID} failed`,
+          );
+      } else if (route === "status") {
+        await expect(runtime.status(handle())).resolves.toMatchObject({
+          state: gone ? "unknown" : "running",
+        });
+      } else {
+        await expect(destroyRailwaySidecar(home, RUN_ID, { exec })).resolves.toMatchObject({
+          destroyed: gone,
+        });
+      }
+      expect(await exists(path)).toBe(!gone);
+    },
+  );
+
+  it.each([
+    { label: "empty successful response", stdout: "", stderr: "", succeeded: true },
+    {
+      label: "explicit destruction",
+      stdout: `✓ Destroyed sandbox ${SANDBOX_ID}`,
+      stderr: "",
+      succeeded: true,
+    },
+    {
+      label: "contradictory successful exit",
+      stdout: `✓ Destroyed sandbox ${SANDBOX_ID}`,
+      stderr: "Error: environment not found",
+      succeeded: false,
+    },
+    {
+      label: "case-mismatched success",
+      stdout: `✓ Destroyed sandbox ${SANDBOX_ID.toUpperCase()}`,
+      stderr: "",
+      succeeded: false,
+    },
+    {
+      label: "ambiguous unquoted success punctuation",
+      stdout: `✓ Destroyed sandbox ${SANDBOX_ID}.`,
+      stderr: "",
+      succeeded: false,
+    },
+    {
+      label: "wrong id success",
+      stdout: "✓ Destroyed sandbox another-id",
+      stderr: "",
+      succeeded: false,
+    },
+  ])(
+    "checks the whole successful destroy response ($label)",
+    async ({ stdout, stderr, succeeded }) => {
+      const home = await mkdtemp(join(tmpdir(), "vapi-railway-destroy-proof-"));
+      homes.push(home);
+      const runtime = createRailwayRuntime({
+        home,
+        exec: async () => ({ code: 0, stdout, stderr }),
+      });
+      if (succeeded) await expect(runtime.stop(handle())).resolves.toBeUndefined();
+      else
+        await expect(runtime.stop(handle())).rejects.toThrow(
+          `railway sandbox destroy ${SANDBOX_ID} failed`,
+        );
+    },
+  );
+
   it.each([
     ["bash: railway: command not found", false],
     ["Error: file not found", false],
@@ -2119,7 +2298,7 @@ describe("railway runtime sandbox-gone detection", () => {
     [`Failed to destroy sandbox ${SANDBOX_ID}: workspace not found`, false],
     [`HTTP 404 for ${SANDBOX_ID}: project not found`, false],
     [`HTTP 404 for ${SANDBOX_ID}0`, false],
-    ["Error: Sandbox not found", true],
+    ["Error: Sandbox not found", false],
     [`Error: Sandbox ${SANDBOX_ID} not found`, true],
     [`Error: sandbox '${SANDBOX_ID}' was not found`, true],
     [`HTTP 404 for ${SANDBOX_ID}`, true],

@@ -11,12 +11,14 @@ scoped packages. The packages share one version and are released together.
 
 ### Breaking (SDK)
 
+- Railway runtime stop/status and `destroyRailwaySidecar` now require complete, case-sensitive sandbox-id confirmations across stdout and stderr. Scoped, conflicting, interrupted and id-less responses fail closed instead of clearing worker state; contradictory successful exits also refuse. No exported types, function signatures or record formats change.
 - `SwarmErrorCode` adds `swarm_workers_active` for active/unresolved-worker dissolution refusals. CLI JSON and MCP return that shared domain code instead of an untyped error.
 - Exported MCP `stopRun` now attempts to stop `unknown` workers and can reject when destruction cannot be confirmed; successful adapter completion is required before persisting `stopped`.
 - MCP adds `swarm.stop` with `name` and exactly one of `runId` or `all: true`. `VapiServerOptions.runtimeForStop` optionally resolves stop-only adapters by runtime kind. The CLI-hosted server supplies local/Railway stop adapters without enabling remote startup or stale-start confirmation over MCP.
 
 ### Fixed
 
+- Railway absence detection no longer accepts a favorable line alongside project/environment, authentication, transport or timeout errors. Ambiguous stops preserve unknown records and prevent dissolution from moving funds.
 - Unknown Railway runs no longer permanently block dissolution after a sandbox disappears. CLI `swarm stop --all` and MCP `swarm.stop` attempt destruction even when status is unknown, persist `stopped` only on success or confirmed absence, and retain blocking records on stop failure. The dissolution error names both recovery commands.
 
 - Swarm dissolution performs one shared core check before any balance lookup, pending movement resumption or transfer. CLI and MCP refresh tracked runs before that check and refuse active or unresolved Railway runs and sidecars with the same stop guidance. The core check also fails closed without a runtime adapter.
