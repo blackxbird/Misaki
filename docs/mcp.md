@@ -185,6 +185,16 @@ through the configured runtime and return before its model loop starts.
 status when their runtime is available. Run summaries omit task text and runtime
 results.
 
+`swarm.stop` takes `{ "name": "<swarm>", "runId": "<run>" }` or
+`{ "name": "<swarm>", "all": true }`. It stops tracked starting, running and
+unknown workers and returns `stopped`, `unchanged` and `failed` summaries. A stop
+failure returns `isError: true` and leaves the record unresolved. The standard
+CLI-hosted MCP server resolves local and Railway adapters for stopping only;
+remote startup and the terminal-only stale-start confirmation remain unchanged.
+An SDK host without the matching runtime gets `runtime_unavailable` and can use
+`vapi swarm stop <name> --all`. Dissolution refusal uses the shared
+`swarm_workers_active` code; it can be retried after a successful stop.
+
 Attached runs reload a member's local caps before each Call payment. Lowering
 caps through `accounts.caps` applies to the next payment in the active run.
 

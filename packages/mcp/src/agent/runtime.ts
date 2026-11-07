@@ -50,6 +50,8 @@ export type RuntimeHandle = {
   startedAt: string;
   /** Adapter-specific process or sandbox reference. It must never contain a secret. */
   ref: string;
+  /** Original creation scope, when returned by Railway; never today's linked scope. */
+  railwayScope?: { projectId?: string; environmentId?: string };
 };
 
 export type RuntimeStatus = {
@@ -74,11 +76,11 @@ export interface Runtime {
   recover?(record: RunRecord): Promise<RuntimeHandle | undefined>;
   /** Retire this exact adapter-owned start after the owner confirms its worker is gone. */
   retireUnreconciledStart?(record: RunRecord): Promise<void>;
-  stop(handle: RuntimeHandle): Promise<void>;
+  stop(handle: RuntimeHandle, options?: { requireSuccessfulExit: true }): Promise<void>;
   status(handle: RuntimeHandle): Promise<RuntimeStatus>;
 }
 
-export type RunState = RuntimeStatus["state"] | "starting";
+export type RunState = RuntimeStatus["state"] | "starting" | "orphaned" | "forgotten";
 
 export class RuntimeError extends Error {
   readonly name = "RuntimeError";
@@ -104,6 +106,8 @@ export type RunRecord = {
   exitCode?: number;
   resultPath?: string;
   detail?: string;
+  forgottenAt?: string;
+  confirmedBy?: "cli";
 };
 
 /** A normal adapter launch should have produced a durable reference well before this bound. */
@@ -131,22 +135,48 @@ const runtimeHandleSchema: z.ZodType<RuntimeHandle> = z.strictObject({
   member: runtimeMemberSchema,
   startedAt: z.iso.datetime(),
   ref: z.string(),
+  railwayScope: z
+    .strictObject({
+      projectId: z.string().min(1).optional(),
+      environmentId: z.string().min(1).optional(),
+    })
+    .optional(),
 });
 
-export const runRecordSchema: z.ZodType<RunRecord> = z.strictObject({
-  v: z.literal(1),
-  runId: runIdSchema,
-  kind: runtimeKindSchema,
-  member: runtimeMemberSchema,
-  run: runtimeRunSchema,
-  handle: runtimeHandleSchema,
-  startedAt: z.iso.datetime(),
-  endedAt: z.iso.datetime().optional(),
-  state: z.enum(["starting", "running", "finished", "failed", "stopped", "unknown"]),
-  exitCode: z.number().int().optional(),
-  resultPath: z.string().optional(),
-  detail: z.string().optional(),
-});
+export const runRecordSchema: z.ZodType<RunRecord> = z
+  .strictObject({
+    v: z.literal(1),
+    runId: runIdSchema,
+    kind: runtimeKindSchema,
+    member: runtimeMemberSchema,
+    run: runtimeRunSchema,
+    handle: runtimeHandleSchema,
+    startedAt: z.iso.datetime(),
+    endedAt: z.iso.datetime().optional(),
+    state: z.enum([
+      "starting",
+      "running",
+      "finished",
+      "failed",
+      "stopped",
+      "unknown",
+      "orphaned",
+      "forgotten",
+    ]),
+    exitCode: z.number().int().optional(),
+    resultPath: z.string().optional(),
+    detail: z.string().optional(),
+    forgottenAt: z.iso.datetime().optional(),
+    confirmedBy: z.literal("cli").optional(),
+  })
+  .refine(
+    (record) =>
+      record.state !== "forgotten" ||
+      (record.forgottenAt !== undefined && record.confirmedBy === "cli"),
+    {
+      message: "A forgotten run requires a timestamp and explicit CLI confirmation.",
+    },
+  );
 
 export function runsDirectory(home: string): string {
   return join(home, "runs");
@@ -225,6 +255,28 @@ export async function refreshRunRecord(
   runtime?: Runtime,
   now: () => Date = () => new Date(),
 ): Promise<RunRecord> {
+  const candidate = await requireRunRecord(home, record.runId);
+  return await withMemberRunLock(
+    home,
+    candidate.member.account,
+    async () => await refreshRunRecordLocked(home, candidate, runtime, now),
+  );
+}
+
+/** The caller already holds this record's member lock (start, stop or refresh). */
+async function refreshRunRecordLocked(
+  home: string,
+  observed: RunRecord,
+  runtime?: Runtime,
+  now: () => Date = () => new Date(),
+): Promise<RunRecord> {
+  const record = await requireRunRecord(home, observed.runId);
+  if (record.member.account !== observed.member.account) {
+    throw new RuntimeError(
+      "runtime_unavailable",
+      `Run ${record.runId} changed members while waiting for its lock.`,
+    );
+  }
   if (
     (record.state !== "starting" && record.state !== "running") ||
     runtime?.kind !== record.kind
@@ -339,7 +391,7 @@ export async function startDetachedRun(args: {
       async () => {
         const records = await listRunRecords(args.home, { account: args.member.account });
         for (const record of records) {
-          const refreshed = await refreshRunRecord(args.home, record, args.runtime, args.now);
+          const refreshed = await refreshRunRecordLocked(args.home, record, args.runtime, args.now);
           if (refreshed.state === "starting" || refreshed.state === "running") {
             throw new RuntimeError(
               "member_busy",
@@ -524,8 +576,13 @@ export async function stopRun(args: {
             `Run ${stored.runId} changed members while waiting for its lock.`,
           );
         }
-        const current = await refreshRunRecord(args.home, stored, args.runtime, args.now);
-        if (current.state !== "starting" && current.state !== "running") return current;
+        const current = await refreshRunRecordLocked(args.home, stored, args.runtime, args.now);
+        if (
+          current.state !== "starting" &&
+          current.state !== "running" &&
+          current.state !== "unknown"
+        )
+          return current;
         if (args.runtime.kind !== current.kind) {
           throw new RuntimeError(
             "runtime_unavailable",
@@ -546,7 +603,11 @@ export async function stopRun(args: {
           }
           await args.runtime.retireUnreconciledStart?.(current);
         } else {
-          await args.runtime.stop(current.handle);
+          if (current.kind === "railway" && current.state === "unknown") {
+            await args.runtime.stop(current.handle, { requireSuccessfulExit: true });
+          } else {
+            await args.runtime.stop(current.handle);
+          }
         }
         const stopped: RunRecord = {
           ...current,
@@ -568,6 +629,32 @@ function memberRunLockPath(home: string, account: string): string {
   return join(runsDirectory(home), `.member-${account}.lock`);
 }
 
+/** Serialize lifecycle observations and mutations for one member, across CLI and MCP. */
+export async function withMemberRunLock<T>(
+  home: string,
+  account: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!WALLET_NAME_PATTERN.test(account))
+    throw new RuntimeError("runtime_unavailable", `Invalid runtime member account: ${account}.`);
+  const busyMessage = `Member ${account} is changing run state.`;
+  try {
+    return await withFileLock(memberRunLockPath(home, account), operation, {
+      timeoutMs: 5_000,
+      lockedMessage: busyMessage,
+    });
+  } catch (error) {
+    if (error instanceof FileLockedError) throw new RuntimeError("member_busy", busyMessage);
+    throw error;
+  }
+}
+
+async function requireRunRecord(home: string, runId: string): Promise<RunRecord> {
+  const record = await readRunRecord(home, runId);
+  if (record === undefined) throw new RuntimeError("run_not_found", `Run ${runId} was not found.`);
+  return record;
+}
+
 export type DetachedRunSummary = {
   member: string;
   role?: string;
@@ -581,6 +668,8 @@ export type DetachedRunSummary = {
   exitCode?: number;
   parentRunId?: string;
   detail?: string;
+  forgottenAt?: string;
+  confirmedBy?: "cli";
 };
 
 export type DetachedSwarmRunResult = {
@@ -606,6 +695,8 @@ export function summarizeRunRecord(record: RunRecord): DetachedRunSummary {
     ...(record.exitCode === undefined ? {} : { exitCode: record.exitCode }),
     ...(record.run.parentRunId === undefined ? {} : { parentRunId: record.run.parentRunId }),
     ...(record.detail === undefined ? {} : { detail: record.detail }),
+    ...(record.forgottenAt === undefined ? {} : { forgottenAt: record.forgottenAt }),
+    ...(record.confirmedBy === undefined ? {} : { confirmedBy: record.confirmedBy }),
   };
 }
 

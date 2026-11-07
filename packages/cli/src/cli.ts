@@ -62,6 +62,7 @@ import {
   swarmParentResolver,
   sweepAboveCeiling,
   SweepGasError,
+  SwarmError,
   TransferError,
   sweepBack,
   unlockProtectedVault,
@@ -225,6 +226,7 @@ Usage:
   vapi swarm run <name> "<task>" --mode each --runtime railway --checkpoint <name> --allow-remote-key [--budget <usd>] [--keep-sandbox] [--json]
   vapi swarm runs <name> [--json]
   vapi swarm stop <name> [<runId>|--all] [--confirm-worker-stopped] [--json]
+  vapi swarm forget-run <name> <runId> --confirm-destroyed [--json]
   vapi send <amount> --from <account> --to <account|owner|0x…> [--network base|arc] [--resume <nonce>] [--json]
   vapi fund [--amount <usd>] [--account <name>] [--json]
   vapi docs "<question>" [--json]
@@ -1002,7 +1004,10 @@ export async function runCli(
           JSON.stringify({
             error: message,
             exitCode: code,
-            ...(error instanceof RuntimeError ? { code: error.code } : {}),
+            ...(error instanceof RuntimeError ||
+            (error instanceof SwarmError && error.code === "swarm_workers_active")
+              ? { code: error.code }
+              : {}),
             ...(error instanceof RouterClientError && error.refill !== undefined
               ? { code: error.code, refill: error.toJSON().refill }
               : {}),
@@ -3715,6 +3720,7 @@ async function mcpCommand(argv: string[], dependencies: CliDependencies): Promis
     receiptsPath: paths.receipts,
     searchesPath: paths.searches,
     runtime: resolveRuntime("local", paths.directory, dependencies),
+    runtimeForStop: (kind) => resolveRuntime(kind, paths.directory, dependencies),
   });
 }
 

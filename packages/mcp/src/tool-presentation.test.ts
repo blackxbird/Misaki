@@ -58,6 +58,7 @@ const destructiveTools = [
   "swarm.allocate",
   "swarm.delegate",
   "swarm.run",
+  "swarm.stop",
 ];
 
 const aliases = {

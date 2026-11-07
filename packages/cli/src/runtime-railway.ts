@@ -38,6 +38,7 @@ import {
   usdToAtomic,
   WalletStore,
   writeJsonAtomic,
+  withFileLock,
   type AgentProfile,
   type SecretStore,
   type SwarmBalanceReader,
@@ -55,6 +56,8 @@ import {
   type MemberBundleConfig,
 } from "@vapi-network/core/secrets";
 import {
+  readRunRecord,
+  withMemberRunLock,
   redactRunText,
   redactRunValue,
   registeredAgentProfileSchema,
@@ -195,6 +198,39 @@ function sandboxIdOf(value: unknown): string | undefined {
     if (typeof id === "string" && SANDBOX_ID_PATTERN.test(id)) return id;
   }
   return "sandbox" in record ? sandboxIdOf(record.sandbox) : undefined;
+}
+
+function sandboxScope(stdout: string, id: string): RuntimeHandle["railwayScope"] {
+  const trimmed = stdout.trim();
+  for (const candidate of [trimmed, ...trimmed.split(/\r?\n/u).reverse()]) {
+    try {
+      const value: unknown = JSON.parse(candidate);
+      if (sandboxIdOf(value) !== id || typeof value !== "object" || value === null) continue;
+      const outer = value as Record<string, unknown>;
+      const sandbox =
+        typeof outer.sandbox === "object" &&
+        outer.sandbox !== null &&
+        sandboxIdOf(outer.sandbox) === id
+          ? (outer.sandbox as Record<string, unknown>)
+          : outer;
+      const projectId =
+        typeof sandbox.projectId === "string" && sandbox.projectId.length > 0
+          ? sandbox.projectId
+          : undefined;
+      const environmentId =
+        typeof sandbox.environmentId === "string" && sandbox.environmentId.length > 0
+          ? sandbox.environmentId
+          : undefined;
+      if (projectId !== undefined || environmentId !== undefined)
+        return {
+          ...(projectId === undefined ? {} : { projectId }),
+          ...(environmentId === undefined ? {} : { environmentId }),
+        };
+    } catch {
+      // Scope is optional. Never replace missing creation metadata with today's link.
+    }
+  }
+  return undefined;
 }
 
 export type RemoteKeyRefusalCode =
@@ -900,6 +936,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
         }
 
         sandboxId = id;
+        const railwayScope = sandboxScope(created.stdout, id);
         try {
           saveSidecar({ ...sidecar, sandboxId: id });
           const handle: RuntimeHandle = {
@@ -908,6 +945,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
             member,
             startedAt,
             ref: id,
+            ...(railwayScope === undefined ? {} : { railwayScope }),
           };
           await persistLaunch?.(handle);
           await audit(`runtime=railway sandbox=${id}`);
@@ -972,6 +1010,7 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
           member,
           startedAt,
           ref: id,
+          ...(railwayScope === undefined ? {} : { railwayScope }),
         };
       } finally {
         removeSignalHandlers();
@@ -1034,10 +1073,18 @@ export function createRailwayRuntime(options: RailwayRuntimeOptions): Runtime {
       return status;
     },
 
-    async stop(handle: RuntimeHandle): Promise<void> {
+    async stop(handle: RuntimeHandle, stopOptions): Promise<void> {
       const id = sandboxRef(handle);
       if (id === undefined) throw new Error("Invalid railway runtime sandbox id.");
-      await destroySandbox(exec, id);
+      if (stopOptions?.requireSuccessfulExit === true) {
+        // An unknown worker cannot be cleared by text or the current CLI scope.
+        // Only the destroy process's successful exit confirms this stop.
+        const outcome = await exec(RAILWAY_CLI.binary, RAILWAY_CLI.destroy(id));
+        if (outcome.code !== 0)
+          throw new Error(`railway sandbox destroy ${id} failed${describeFailure(outcome, [])}`);
+      } else {
+        await destroySandbox(exec, id);
+      }
       await removeSidecar(home, handle.runId);
     },
   };
@@ -1076,32 +1123,101 @@ export async function destroyRailwaySidecar(
   runId: string,
   options: { exec?: RailwayExec } = {},
 ): Promise<{ runId: string; sandboxId?: string; destroyed: boolean; error?: string }> {
-  const sidecar = await readSidecar(home, runId);
-  if (sidecar === undefined) {
-    return { runId, destroyed: false, error: `No readable railway sidecar for run ${runId}.` };
-  }
-  const id = sidecar.sandboxId;
-  if (id === undefined) {
-    const holder = sidecar.account === "" ? "a member" : sidecar.account;
-    return {
-      runId,
-      destroyed: false,
-      error: `Run ${runId} has no sandbox id, and a sandbox holding ${holder}'s private key may exist. Find it with railway sandbox list and run railway sandbox destroy <id>.`,
-    };
-  }
   try {
-    await destroySandbox(options.exec ?? defaultRailwayExec, id);
+    const observed = await readSidecar(home, runId);
+    const record = await readRunRecord(home, runId);
+    const account = sidecarAccount(observed, record);
+    const destroy = async () => {
+      const currentRecord = await readRunRecord(home, runId);
+      const sidecar = await readSidecar(home, runId);
+      if (sidecarAccount(sidecar, currentRecord) !== account) {
+        throw new RuntimeError(
+          "runtime_unavailable",
+          `Run ${runId} changed members while waiting for its lock. Retry cleanup.`,
+        );
+      }
+      if (currentRecord?.state === "forgotten") {
+        return sidecar === undefined
+          ? { runId, destroyed: true }
+          : {
+              runId,
+              destroyed: false,
+              error: `Run ${runId} was already forgotten but still has a sidecar. Inspect its current metadata; nothing was rewritten.`,
+            };
+      }
+      if (sidecar === undefined) {
+        return { runId, destroyed: false, error: `No readable railway sidecar for run ${runId}.` };
+      }
+      const id = sidecar.sandboxId;
+      if (id === undefined) {
+        const holder = sidecar.account === "" ? "a member" : sidecar.account;
+        return {
+          runId,
+          destroyed: false,
+          error: `Run ${runId} has no sandbox id, and a sandbox holding ${holder}'s private key may exist. Find it with railway sandbox list and run railway sandbox destroy <id>.`,
+        };
+      }
+      try {
+        await destroySandbox(options.exec ?? defaultRailwayExec, id);
+      } catch (error) {
+        // An unattributed legacy sidecar is already unresolved. Preserve its
+        // existing metadata rather than rewriting it without a member lock.
+        if (account !== undefined)
+          await writeSidecar(home, runId, { ...sidecar, state: "orphaned" }).catch(() => undefined);
+        return {
+          runId,
+          sandboxId: id,
+          destroyed: false,
+          error: `${scrub(errorMessage(error), [])}\nDestroy it yourself with: railway sandbox destroy ${id}`,
+        };
+      }
+      if (
+        account === undefined &&
+        sidecarAccount(await readSidecar(home, runId), await readRunRecord(home, runId)) !==
+          undefined
+      )
+        throw new RuntimeError(
+          "runtime_unavailable",
+          `Run ${runId} acquired member ownership during cleanup. Retry under its member lock.`,
+        );
+      await removeSidecar(home, runId);
+      return { runId, sandboxId: id, destroyed: true };
+    };
+    if (account !== undefined) return await withMemberRunLock(home, account, destroy);
+    // Legacy metadata can have no member at all. Forget cannot act on such a
+    // sidecar; serialize its cleanup by run id and reject any new ownership.
+    return await withFileLock(join(runsDirectory(home), `.sidecar-${runId}.lock`), destroy, {
+      timeoutMs: 5_000,
+      lockedMessage: `Run ${runId} is changing sidecar state.`,
+    });
   } catch (error) {
-    await writeSidecar(home, runId, { ...sidecar, state: "orphaned" }).catch(() => undefined);
     return {
       runId,
-      sandboxId: id,
       destroyed: false,
-      error: `${scrub(errorMessage(error), [])}\nDestroy it yourself with: railway sandbox destroy ${id}`,
+      error:
+        error instanceof RuntimeError
+          ? error.message
+          : `Could not reconcile the current Railway run/sidecar for ${runId}.`,
     };
   }
-  await removeSidecar(home, runId);
-  return { runId, sandboxId: id, destroyed: true };
+}
+
+function sidecarAccount(
+  sidecar: RailwaySidecar | undefined,
+  record: RunRecord | undefined,
+): string | undefined {
+  if (
+    record !== undefined &&
+    (record.kind !== "railway" ||
+      (sidecar?.account && sidecar.account !== record.member.account) ||
+      (sidecar?.swarm && record.member.swarm && sidecar.swarm !== record.member.swarm))
+  ) {
+    throw new RuntimeError(
+      "runtime_unavailable",
+      `Run ${record.runId} has mismatched Railway ownership metadata; nothing was changed.`,
+    );
+  }
+  return record?.member.account || sidecar?.account || undefined;
 }
 
 /** Destroys a sandbox; a clear sandbox-scoped not-found counts as destroyed. */

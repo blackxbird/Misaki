@@ -1,3 +1,5 @@
+import { rm } from "node:fs/promises";
+
 import {
   activeAgentMarker,
   ARC_MAINNET_CAIP2,
@@ -34,6 +36,7 @@ import {
 import {
   assessSwarmMembers,
   listRunRecords,
+  readRunRecord,
   redactRunText,
   refreshRunRecord,
   runSwarm,
@@ -41,6 +44,8 @@ import {
   startDetachedSwarmRun,
   stopRun,
   summarizeRunRecord,
+  writeRunRecord,
+  withMemberRunLock,
   type AgentEvent,
   type DetachedRunSummary,
   type RunRecord,
@@ -73,6 +78,7 @@ import {
   assertRemoteSafeMember,
   destroyRailwaySidecar,
   listRailwaySidecars,
+  railwaySidecarPath,
   ownerBalanceReader,
   RAILWAY_CHECKPOINT_PATTERN,
   RAILWAY_CHECKPOINT_RULE,
@@ -81,7 +87,7 @@ import {
 } from "./runtime-railway.js";
 
 const SWARM_USAGE =
-  "Usage: vapi swarm [create|add|remove|fund|rebalance|status|dissolve|run|runs|stop] …";
+  "Usage: vapi swarm [create|add|remove|fund|rebalance|status|dissolve|run|runs|stop|forget-run] …";
 const CREATE_USAGE =
   "Usage: vapi swarm create <name> [--agents <n>|--roles <a,b,c>] [--fund <usd> --from <account>] [--strategy <targets|even|weights>] [--targets <role=usd,...>] [--caps <perCall>/<perDay>] [--treasury-caps <perCall>/<perDay>] [--network <base|arc>] [--model <id>] [--no-wait] [--json]";
 const ADD_USAGE = "Usage: vapi swarm add <name> <role> [--json]";
@@ -98,6 +104,7 @@ const REMOTE_KEY_WARNING =
 const RUNS_USAGE = "Usage: vapi swarm runs <name> [--json]";
 const STOP_USAGE =
   "Usage: vapi swarm stop <name> [<runId>|--all] [--confirm-worker-stopped] [--json]";
+const FORGET_USAGE = "Usage: vapi swarm forget-run <name> <runId> --confirm-destroyed [--json]";
 
 export async function swarmCommand(
   argv: string[],
@@ -128,6 +135,8 @@ export async function swarmCommand(
       return await runsCommand(rest, json, io, dependencies);
     case "stop":
       return await stopCommand(rest, json, io, dependencies);
+    case "forget-run":
+      return await forgetRunCommand(rest, json, io, dependencies);
     default:
       throw new UsageError(
         subcommand === undefined
@@ -376,49 +385,9 @@ async function dissolveCommand(
   const parsed = parseArguments(argv, { valueOptions: new Set(), maximumPositionals: 1 });
   const name = requiredPositional(parsed.positionals[0], "<name>", DISSOLVE_USAGE);
   const context = await commandContext(dependencies, io);
-  await assertNoRemoteSandboxes(context.store.home, name, dependencies);
   const result = await dissolveSwarm({ name }, capitalDependencies(context, dependencies));
   outputCapital(result, json, io);
   return result.status === "dissolved" ? 0 : 1;
-}
-
-/**
- * Dissolving a swarm must not strand a sandbox that holds a member key: while a
- * railway run is running or a railway sidecar of this swarm exists, dissolve
- * refuses and names the stop command. The refresh first destroys the sandboxes
- * of finished runs, exactly as `vapi swarm runs` does.
- */
-async function assertNoRemoteSandboxes(
-  home: string,
-  name: string,
-  dependencies: CliDependencies,
-): Promise<void> {
-  const records = await refreshedSwarmRecords(home, name, dependencies);
-  const running = records.filter(
-    (record) =>
-      record.kind === "railway" && (record.state === "starting" || record.state === "running"),
-  );
-  const runIds = new Set(running.map((record) => record.runId));
-  const sidecars = (await listRailwaySidecars(home)).filter(
-    (sidecar) => sidecar.swarm === name && !runIds.has(sidecar.runId),
-  );
-  if (running.length === 0 && sidecars.length === 0) return;
-  const sandboxes = [
-    ...running.map(
-      (record) => `${record.member.account} (run ${record.runId}, sandbox ${record.handle.ref})`,
-    ),
-    ...sidecars.map(
-      (sidecar) =>
-        `${sidecar.account || "a member"} (run ${sidecar.runId}, ${sidecar.sandboxId === undefined ? "sandbox id unknown" : `sandbox ${sidecar.sandboxId}`})`,
-    ),
-  ];
-  throw new Error(
-    [
-      `Swarm ${name} still has Railway sandboxes that may hold a member key: ${sandboxes.join(", ")}.`,
-      `Stop them first with: vapi swarm stop ${name} --all`,
-      "Then dissolve again. Nothing was moved.",
-    ].join("\n"),
-  );
 }
 
 /**
@@ -803,7 +772,7 @@ async function stopCommand(
   const unchanged: DetachedRunSummary[] = [];
   const failed: StopFailure[] = [];
   for (const record of targets) {
-    if (record.state !== "starting" && record.state !== "running") {
+    if (record.state !== "starting" && record.state !== "running" && record.state !== "unknown") {
       unchanged.push(summarizeRunRecord(record));
       continue;
     }
@@ -818,7 +787,7 @@ async function stopCommand(
         ...(confirmWorkerStopped ? { confirmWorkerStopped: true } : {}),
       });
     } catch (error) {
-      // The record stays running; the other runs are still stopped.
+      // A failed stop stays unresolved; the other runs are still stopped.
       failed.push({
         runId: record.runId,
         member: record.member.account,
@@ -851,6 +820,126 @@ async function stopCommand(
   return failed.length > 0 || sandboxes.some((sandbox) => !sandbox.destroyed) ? 1 : 0;
 }
 
+/** Explicit owner confirmation lives in the CLI; no MCP tool exposes this transition. */
+async function forgetRunCommand(
+  argv: string[],
+  json: boolean,
+  io: CliIo,
+  dependencies: CliDependencies,
+): Promise<number> {
+  const parsed = parseArguments(argv, {
+    valueOptions: new Set(),
+    booleanOptions: new Set(["--confirm-destroyed"]),
+    maximumPositionals: 2,
+  });
+  const name = requiredPositional(parsed.positionals[0], "<name>", FORGET_USAGE);
+  const runId = requiredPositional(parsed.positionals[1], "<runId>", FORGET_USAGE);
+  if (!parsed.has("--confirm-destroyed"))
+    throw new UsageError(
+      `Verify destruction in the original Railway project/environment, then supply --confirm-destroyed.\n${FORGET_USAGE}`,
+    );
+  if (!isRunId(runId)) throw new RuntimeError("invalid_run_id", `Invalid run id: ${runId}.`);
+  const { store } = await commandContext(dependencies, io);
+  const home = store.home;
+  await assertSwarmReachable(home, name);
+  const candidate = await readRunRecord(home, runId);
+  const orphan = (await listRailwaySidecars(home)).find((sidecar) => sidecar.runId === runId);
+  const account = candidate?.member.account ?? orphan?.account;
+  if (account === undefined || account === "")
+    throw new RuntimeError("run_not_found", `Run ${runId} was not found for swarm ${name}.`);
+  assertWalletName(account);
+  return await withMemberRunLock(home, account, async () => {
+    let record = await readRunRecord(home, runId);
+    const recoveredOrphan = record === undefined;
+    const sidecar = (await listRailwaySidecars(home)).find((item) => item.runId === runId);
+    if (record !== undefined && (record.member.account !== account || record.member.swarm !== name))
+      throw new RuntimeError("run_not_found", `Run ${runId} was not found for swarm ${name}.`);
+    if (
+      sidecar !== undefined &&
+      ((sidecar.account !== "" && sidecar.account !== account) ||
+        (sidecar.swarm !== "" && sidecar.swarm !== name) ||
+        (record?.handle.ref &&
+          sidecar.sandboxId !== undefined &&
+          record.handle.ref !== sidecar.sandboxId))
+    )
+      throw new RuntimeError(
+        "runtime_unavailable",
+        `Run ${runId} has a mismatched Railway sidecar; nothing was forgotten.`,
+      );
+    if (record === undefined) {
+      if (sidecar?.state !== "orphaned")
+        throw new RuntimeError(
+          "runtime_unavailable",
+          "Only an unknown or orphaned Railway run can be forgotten.",
+        );
+      const recoveredAt = (dependencies.now?.() ?? new Date()).toISOString();
+      const member = { swarm: name, account, profile: account };
+      record = {
+        v: 1,
+        runId,
+        kind: "railway",
+        member,
+        run: { runId, task: "Recovered orphaned Railway sandbox", mode: "agent" },
+        handle: {
+          runId,
+          kind: "railway",
+          member,
+          startedAt: recoveredAt,
+          ref: sidecar.sandboxId ?? "",
+        },
+        startedAt: recoveredAt,
+        state: "orphaned",
+        detail:
+          "Recovered from an orphaned Railway sidecar; original start time and scope were not recorded.",
+      };
+    }
+    if (record.kind !== "railway" || (record.state !== "unknown" && record.state !== "orphaned"))
+      throw new RuntimeError(
+        "runtime_unavailable",
+        "Only an unknown or orphaned Railway run can be forgotten.",
+      );
+    const sandboxId = record.handle.ref || sidecar?.sandboxId || null;
+    const projectId = record.handle.railwayScope?.projectId ?? null;
+    const environmentId = record.handle.railwayScope?.environmentId ?? null;
+    const shellWord = (value: string) =>
+      /^[A-Za-z0-9_.:-]+$/u.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+    const check = `railway sandbox list --project ${projectId === null ? "<original-project>" : shellWord(projectId)} --environment ${environmentId === null ? "<original-environment>" : shellWord(environmentId)}`;
+    const forgottenAt = (dependencies.now?.() ?? new Date()).toISOString();
+    io.stderr(`Sandbox: ${sandboxId ?? "not recorded"}`);
+    io.stderr(`Original Railway project: ${projectId ?? "not recorded"}`);
+    io.stderr(`Original Railway environment: ${environmentId ?? "not recorded"}`);
+    io.stderr(`Verify destruction in that scope with: ${check}`);
+    // Keep a blocking record before retiring an orphan-only sidecar. A failed
+    // final write leaves this record unresolved and eligible for a later retry.
+    if (recoveredOrphan) await writeRunRecord(home, record);
+    if (sidecar !== undefined) await rm(railwaySidecarPath(home, runId), { force: true });
+    const forgotten: RunRecord = {
+      ...record,
+      state: "forgotten",
+      forgottenAt,
+      confirmedBy: "cli",
+    };
+    await writeRunRecord(home, forgotten);
+    const result = {
+      swarm: name,
+      runId,
+      sandboxId,
+      projectId,
+      environmentId,
+      check,
+      state: forgotten.state,
+      forgottenAt,
+      confirmedBy: forgotten.confirmedBy,
+    };
+    if (json) io.stdout(JSON.stringify(result));
+    else
+      io.stdout(
+        `${runId}: forgotten after CLI confirmation at ${forgottenAt}. The run record is retained.`,
+      );
+    return 0;
+  });
+}
+
 type StopFailure = { runId: string; member: string; error: string };
 type SandboxDestroyResult = Awaited<ReturnType<typeof destroyRailwaySidecar>>;
 type SandboxSummary = {
@@ -872,7 +961,9 @@ async function strandedSandboxes(
   records: readonly RunRecord[],
 ): Promise<RailwaySidecar[]> {
   const running = new Set(
-    records.filter((record) => record.state === "running").map((record) => record.runId),
+    records
+      .filter((record) => record.state === "running" || record.state === "unknown")
+      .map((record) => record.runId),
   );
   return (await listRailwaySidecars(home)).filter(
     (sidecar) =>
@@ -1014,6 +1105,9 @@ function capitalDependencies(
     },
     ...(dependencies.now === undefined ? {} : { now: () => dependencies.now!().getTime() }),
     ...capitalSeams,
+    reconcileRuns: async ({ home, name }) => {
+      await refreshedSwarmRecords(home, name, dependencies);
+    },
   };
 }
 

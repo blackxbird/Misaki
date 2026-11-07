@@ -1478,6 +1478,58 @@ describe("railway runtime lifecycle", () => {
     expect(railway.calls.filter((call) => call[1] === "destroy")).toEqual([]);
   });
 
+  it.each([true, false])(
+    "persists only original scope supplied in creation JSON (scope present=%s)",
+    async (present) => {
+      const f = await fixture();
+      const scope = { projectId: "original-project", environmentId: "original-environment" };
+      const railway = fakeRailway({
+        create: () => ({
+          code: 0,
+          stdout: JSON.stringify({ id: SANDBOX_ID, ...(present ? scope : {}) }),
+          stderr: "",
+        }),
+      });
+      const record = await startDetachedRun({
+        home: f.home,
+        runtime: runtimeFor(f, railway.exec),
+        member: MEMBER,
+        run: RUN,
+        env: {},
+      });
+      expect(record.handle.railwayScope).toEqual(present ? scope : undefined);
+      expect((await readRunRecord(f.home, RUN_ID))?.handle.railwayScope).toEqual(
+        present ? scope : undefined,
+      );
+    },
+  );
+
+  it("keeps an unknown run blocked when the stop adapter was configured with another home", async () => {
+    const f = await fixture();
+    const other = await mkdtemp(join(tmpdir(), "vapi-railway-other-home-"));
+    homes.push(other);
+    const record = {
+      v: 1 as const,
+      runId: RUN_ID,
+      kind: "railway" as const,
+      member: MEMBER,
+      handle: handle(),
+      run: RUN,
+      startedAt: STARTED_AT,
+      state: "unknown" as const,
+    };
+    await writeRunRecord(f.home, record);
+    const railway = fakeRailway({ destroy: () => SANDBOX_GONE });
+    await expect(
+      stopRun({
+        home: f.home,
+        record,
+        runtime: createRailwayRuntime({ home: other, exec: railway.exec }),
+      }),
+    ).rejects.toThrow(`railway sandbox destroy ${SANDBOX_ID} failed`);
+    expect((await readRunRecord(f.home, RUN_ID))?.state).toBe("unknown");
+  });
+
   it("stops by destroying the sandbox and treats a missing sandbox as stopped", async () => {
     const f = await fixture();
     const railway = fakeRailway();

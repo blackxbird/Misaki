@@ -7,6 +7,8 @@ import {
   ONRAMP_NETWORK,
   STATS_RANGES,
   SpendCapExceededError,
+  SWARM_NAME_PATTERN,
+  RUN_ID_PATTERN,
   SwarmError,
   TransferError,
   VAPI_CLIENT_VERSION,
@@ -52,12 +54,15 @@ import { createCallPort, walletArgument } from "./actions/call.js";
 import type { ActionContext, SwarmPort } from "./actions/context.js";
 import type { Action } from "./actions/define.js";
 import { actions, runAction } from "./actions/register.js";
-import { swarmAgentActions } from "./actions/swarm-agent.js";
+import { swarmAgentActions, detachedRunSummarySchema } from "./actions/swarm-agent.js";
 import { swarmActions, type SwarmSetupOutput } from "./actions/swarm.js";
 import { createAgentRunDeps } from "./agent/deps.js";
 import {
   listRunRecords,
   refreshRunRecord,
+  RuntimeError,
+  stopRun,
+  redactRunText,
   startDetachedSwarmRun,
   summarizeRunRecord,
   type Runtime,
@@ -169,6 +174,8 @@ export type VapiServerOptions = {
     Pick<SwarmCapitalDeps, "balanceReader" | "transfer" | "randomId" | "randomNonce"> | undefined;
   /** Background runtime used by detached swarm runs. */
   runtime?: Runtime | undefined;
+  /** Stop-only adapter resolution; it never enables remote startup over MCP. */
+  runtimeForStop?: (kind: Runtime["kind"]) => Runtime;
 };
 
 const allWalletsArgument = {
@@ -821,6 +828,12 @@ export function createVapiServer(options: VapiServerOptions = {}) {
     ...(options.ledgerPath === undefined ? {} : { ledgerPath: options.ledgerPath }),
     ...(accountsOptions.now === undefined ? {} : { now: accountsOptions.now }),
     ...options.swarm,
+    reconcileRuns: async ({ home, name }) => {
+      const records = await listRunRecords(home, { swarm: name });
+      for (const record of records) {
+        await refreshRunRecord(home, record, options.runtime);
+      }
+    },
     unlock: async (account) => {
       const selected = await session.payment(account);
       return {
@@ -1309,6 +1322,100 @@ export function createVapiServer(options: VapiServerOptions = {}) {
           allowPrivateNetwork: config.allowPrivateNetwork,
         }),
       ),
+  );
+
+  const stopInput = z
+    .strictObject({
+      name: z.string().regex(SWARM_NAME_PATTERN),
+      runId: z.string().regex(RUN_ID_PATTERN).optional(),
+      all: z.boolean().optional(),
+    })
+    .refine((input) => (input.runId !== undefined) !== (input.all === true), {
+      message: "Provide exactly one of runId or all: true.",
+    });
+  server.registerTool(
+    "swarm.stop",
+    {
+      description:
+        "Stop one or all tracked workers of a swarm, including unknown runs. Unknown Railway runs require a successful destroy exit; not-found text never clears them. Failed stops remain unresolved. Does not move money or expose CLI-only human confirmation.",
+      inputSchema: stopInput.shape,
+      strictInput: true,
+      outputSchema: z.object({
+        swarm: z.string(),
+        stopped: z.array(detachedRunSummarySchema),
+        unchanged: z.array(detachedRunSummarySchema),
+        failed: z.array(
+          z.object({ runId: z.string(), member: z.string(), code: z.string(), error: z.string() }),
+        ),
+      }),
+    },
+    async (rawInput) => {
+      const result = await asStructuredToolResult(
+        async () => {
+          const input = stopInput.parse(rawInput);
+          await readSwarm(session.home, input.name);
+          const records = await listRunRecords(session.home, { swarm: input.name });
+          const targets =
+            input.all === true ? records : records.filter((record) => record.runId === input.runId);
+          if (input.runId !== undefined && targets.length === 0)
+            throw new RuntimeError(
+              "run_not_found",
+              `Run ${input.runId} was not found for swarm ${input.name}.`,
+            );
+          const stopped: ReturnType<typeof summarizeRunRecord>[] = [];
+          const unchanged: ReturnType<typeof summarizeRunRecord>[] = [];
+          const failed: Array<{ runId: string; member: string; code: string; error: string }> = [];
+          for (const record of targets) {
+            if (
+              record.state !== "starting" &&
+              record.state !== "running" &&
+              record.state !== "unknown"
+            ) {
+              unchanged.push(summarizeRunRecord(record));
+              continue;
+            }
+            try {
+              const runtime = options.runtimeForStop?.(record.kind) ?? options.runtime;
+              if (runtime?.kind !== record.kind)
+                throw new RuntimeError(
+                  "runtime_unavailable",
+                  `Runtime ${record.kind} is unavailable. Stop it with: vapi swarm stop ${input.name} --all`,
+                );
+              const updated = await stopRun({ home: session.home, runtime, record });
+              (updated.state === "stopped" ? stopped : unchanged).push(summarizeRunRecord(updated));
+            } catch (error) {
+              failed.push({
+                runId: record.runId,
+                member: record.member.account,
+                code: error instanceof RuntimeError ? error.code : "runtime_stop_failed",
+                error: redactRunText(
+                  error instanceof Error ? error.message : String(error),
+                  options.env ?? process.env,
+                ),
+              });
+            }
+          }
+          return { swarm: input.name, stopped, unchanged, failed };
+        },
+        (error) =>
+          error instanceof RuntimeError
+            ? {
+                isError: true as const,
+                content: [
+                  {
+                    type: "text" as const,
+                    text: JSON.stringify({ code: error.code, message: error.message }),
+                  },
+                ],
+              }
+            : swarmErrorResult(error),
+      );
+      return !("isError" in result) &&
+        Array.isArray(result.structuredContent.failed) &&
+        result.structuredContent.failed.length > 0
+        ? { ...result, isError: true as const }
+        : result;
+    },
   );
 
   for (const action of swarmActions) {
