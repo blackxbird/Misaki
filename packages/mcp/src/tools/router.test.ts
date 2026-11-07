@@ -2,7 +2,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { WalletStore, getDefaultConfig, type SecretStore } from "@vapi-network/core";
+import {
+  WalletStore,
+  getDefaultConfig,
+  drainCeilingSweeps,
+  type Receipt,
+  type SecretStore,
+} from "@vapi-network/core";
 import {
   RouterClientError,
   type AgentRouterUsage,
@@ -11,6 +17,8 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createVapiServer, type VapiServerOptions } from "../server.js";
+import { purchaseTransport } from "../../../../test-fixtures/router-purchase.js";
+import { agentSecretAccounts } from "@vapi-network/core/agent-link";
 
 const API_BASE = "https://console.example.test/";
 const RESET_TIME = "2026-09-24T00:00:00.000Z";
@@ -20,6 +28,7 @@ const FORBIDDEN_FIELDS = new Set(["key", "apiKey", "secret"]);
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
+  await drainCeilingSweeps();
   vi.restoreAllMocks();
   await Promise.all(
     temporaryDirectories
@@ -29,6 +38,73 @@ afterEach(async () => {
 });
 
 describe("vAPI Router MCP tools", () => {
+  it.each(["audit", "key", "balance"] as const)(
+    "returns success through real payment when %s follow-up fails",
+    async (failure) => {
+      const home = await mkdtemp(join(tmpdir(), "vapi-router-paid-"));
+      temporaryDirectories.push(home);
+      const secrets = memoryStore();
+      const store = await WalletStore.open(home, { secrets });
+      const main = await store.create("main", "", {
+        phrase: "test test test test test test test test test test test junk",
+      });
+      await store.setSpendCaps("main", { perCallAtomic: "5000000", perDayAtomic: "20000000" });
+      await store.setLink("main", {
+        apiBase: API_BASE,
+        clientId: "agent_main",
+        owner: OWNER,
+        label: "main",
+        scopes: ["mcp:call", "router.use"],
+        linkedAt: "2026-11-06T00:00:00.000Z",
+        routerBaseUrl: "https://router.example",
+      });
+      await secrets.set(
+        agentSecretAccounts("main").tokens,
+        JSON.stringify({
+          accessToken: "test-access-token",
+          refreshToken: "test-refresh-token",
+          expiresAt: Number.MAX_SAFE_INTEGER,
+          scopes: ["mcp:call", "router.use"],
+        }),
+      );
+      const { fetchImpl, calls } = purchaseTransport(home, failure);
+      const config = getDefaultConfig({});
+      config.allowPrivateNetwork = true;
+      const server = createVapiServer({
+        account: main.account,
+        config,
+        store,
+        secretStore: secrets,
+        env: {},
+        fetchImpl,
+        ledgerPath: join(home, "spend-ledger.json"),
+        receiptsPath: join(home, "receipts.jsonl"),
+      });
+      try {
+        const result = await server.callTool({ name: "router.buy", arguments: { usd: 5 } });
+        expect(result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(calls.paid).toBe(1);
+        expect(result.structuredContent).toMatchObject({
+          receipt: { amountUsd: 4.75 },
+          warnings: [
+            {
+              code:
+                failure === "audit"
+                  ? "audit_unavailable"
+                  : failure === "key"
+                    ? "router_key_unavailable"
+                    : "balance_unavailable",
+            },
+          ],
+        });
+        expectPublicValue(result);
+        expect(JSON.stringify(result)).not.toContain("private-follow-up-error-must-not-leak");
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
   it("registers only the four public Router tools with secret-safe schemas and descriptions", async () => {
     const { server } = await routerServer();
     const { tools } = await server.listTools();
@@ -213,6 +289,86 @@ describe("vAPI Router MCP tools", () => {
     await server.close();
   });
 
+  it("preserves settled refill evidence in payment-aware chat errors without private fields", async () => {
+    const purchase = {
+      receipt: {
+        id: "paid-first-refill",
+        timestamp: RESET_TIME,
+        resourceUrl: "https://api.example/topup",
+        quote: { amountAtomic: "1000000", network: "eip155:8453" },
+        secret: "hidden",
+      },
+      balance: null,
+      warnings: [
+        {
+          code: "router_key_unavailable" as const,
+          message: "Key recovery is pending.",
+          secret: "hidden",
+        },
+      ],
+    };
+    const message =
+      "Payment settled, but the Router balance key is not yet available. It will be fetched on the next request.";
+    const { server } = await routerServer({
+      routerChat: async () => {
+        throw new RouterClientError("refill_pending", message, undefined, purchase);
+      },
+    });
+    const result = await server.callTool({
+      name: "router.chat",
+      arguments: { model: "m", messages: [{ role: "user", content: "hi" }] },
+    });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      code: "refill_pending",
+      message,
+      refill: {
+        receipt: { id: "paid-first-refill", amountUsd: 1 },
+        balance: null,
+        warnings: [{ code: "router_key_unavailable" }],
+      },
+    });
+    expectPublicValue(result);
+    await server.close();
+  });
+
+  it("returns auto-refill warnings with successful chat without private fields", async () => {
+    const refill = {
+      receipt: {
+        id: "paid-refill",
+        timestamp: RESET_TIME,
+        resourceUrl: "https://api.example/topup",
+        quote: { amountAtomic: "1000000", network: "eip155:8453" },
+        secret: "hidden",
+      },
+      balance: null,
+      warnings: [
+        {
+          code: "balance_unavailable" as const,
+          message: "Payment succeeded; balance unavailable.",
+          secret: "hidden",
+        },
+      ],
+    };
+    const { server } = await routerServer({
+      routerChat: async () => ({ ...chatResult(), refill }),
+    });
+    const result = await server.callTool({
+      name: "router.chat",
+      arguments: { model: "m", messages: [{ role: "user", content: "hi" }] },
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      refill: {
+        receipt: { id: "paid-refill", amountUsd: 1 },
+        balance: null,
+        warnings: [{ code: "balance_unavailable" }],
+      },
+    });
+    expectPublicValue(result);
+    await server.close();
+  });
+
   it("returns budget exhaustion with its reset time as a normal tool error", async () => {
     const routerChat = vi.fn<NonNullable<RouterOverrides["routerChat"]>>(async () => {
       throw new RouterClientError(
@@ -292,6 +448,60 @@ describe("vAPI Router MCP tools", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     await server.close();
   });
+
+  it.each([
+    {
+      label: "the charged quote rather than the requested tier",
+      quote: { network: "eip155:5042", amountAtomic: "4750000" },
+      evidence: { network: "eip155:8453" },
+      amountUsd: 4.75,
+      network: "eip155:5042",
+    },
+    {
+      label: "settlement evidence when the quote is absent",
+      quote: undefined,
+      evidence: { network: "eip155:5042" },
+      amountUsd: null,
+      network: "eip155:5042",
+    },
+    {
+      label: "unknown values when payment metadata is absent",
+      quote: undefined,
+      evidence: undefined,
+      amountUsd: null,
+      network: "unknown",
+    },
+  ])(
+    "reports $label after a successful purchase",
+    async ({ quote, evidence, amountUsd, network }) => {
+      const receipt: Receipt = {
+        id: "receipt-router-5",
+        timestamp: "2026-09-23T12:00:00.000Z",
+        resourceUrl: `${API_BASE}api/router/top-up/5`,
+        quote,
+        settlement: { outcome: "succeeded", evidence },
+      };
+      const buyRouterBalance = vi.fn<NonNullable<RouterOverrides["buyRouterBalance"]>>(
+        async () => ({
+          receipt,
+          balance: null,
+        }),
+      );
+      const { server, store } = await routerServer({ buyRouterBalance });
+      await store.setSpendCaps("main", { perCallAtomic: "50000000", perDayAtomic: "50000000" });
+
+      const result = await server.callTool({ name: "router.buy", arguments: { usd: 5 } });
+
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      expect(result.structuredContent).toEqual({
+        receipt: { id: receipt.id, amountUsd, network },
+        balance: null,
+      });
+      expect(buyRouterBalance).toHaveBeenCalledTimes(1);
+      expectPublicValue(result);
+      await server.close();
+    },
+  );
 
   it("buys through the injected core seam and returns only a public receipt summary", async () => {
     const buyRouterBalance = vi.fn<NonNullable<RouterOverrides["buyRouterBalance"]>>(async () => ({

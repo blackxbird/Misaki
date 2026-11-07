@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SpendCapError,
   SpendCapExceededError,
+  getDefaultConfig,
+  appendReceipt,
+  getVapiPaths,
+  drainCeilingSweeps,
+  type Receipt,
   type SecretStore,
   WalletStore,
 } from "@vapi-network/core";
@@ -22,6 +27,7 @@ import {
 } from "@vapi-network/core/router-client";
 
 import { runCli, type CliDependencies, type CliIo } from "./cli.js";
+import { purchaseTransport } from "../../../test-fixtures/router-purchase.js";
 
 const PASSPHRASE = "test-only-passphrase";
 const WALLET = "researcher";
@@ -35,6 +41,7 @@ let activeSecretStore: SecretStore | undefined;
 let activeSecretEntries: Record<string, string> | undefined;
 
 afterEach(async () => {
+  await drainCeilingSweeps();
   restoreEnvironment("VAPI_HOME", originalHome);
   activeSecretStore = undefined;
   activeSecretEntries = undefined;
@@ -57,6 +64,214 @@ describe("vapi router models", () => {
       await runCli(["router", "models", "--wallet", WALLET, "--json"], json.io, dependencies),
     ).toBe(0);
     expect(JSON.parse(json.stdout[0]!)).toEqual(["model-a", "model-b"]);
+  });
+});
+
+describe("vapi router clear-pending", () => {
+  it.each([
+    "receipt",
+    "settled",
+    "used",
+    "live",
+    "margin",
+    "expired",
+    "rpc-error",
+    "unsupported",
+    "prepared",
+  ] as const)("resolves %s evidence before an explicit clear", async (state) => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    const now = new Date("2026-11-07T10:00:00.000Z");
+    const config = getDefaultConfig({});
+    // Explicit fixture networks keep the test independent of operator RPC settings.
+    config.networks["eip155:5042"] = {
+      rpcUrl: "https://rpc.example",
+      usdc: "0x3600000000000000000000000000000000000000",
+    };
+    await writeFile(join(home, "config.json"), JSON.stringify(config));
+    const validBefore =
+      Math.floor(now.getTime() / 1000) + (state === "live" ? 120 : state === "margin" ? -5 : -120);
+    const pending = {
+      receiptId: `clear-${state}`,
+      status:
+        state === "prepared"
+          ? ("prepared" as const)
+          : state === "settled"
+            ? ("settled" as const)
+            : ("signed" as const),
+      createdAt: now.toISOString(),
+      tierUsd: 5 as const,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "public-client",
+        owner: "0x1111111111111111111111111111111111111111" as const,
+        label: "test",
+        scopes: [],
+        linkedAt: now.toISOString(),
+      },
+      network: state === "unsupported" ? "eip155:999999" : "eip155:5042",
+      ...(state === "prepared"
+        ? {}
+        : {
+            authorization: {
+              token: config.networks["eip155:5042"]!.usdc,
+              from: "0x1111111111111111111111111111111111111111",
+              nonce: `0x${"ab".repeat(32)}`,
+              validBefore: String(validBefore),
+            },
+          }),
+    };
+    await store.setRouterPendingPurchase(WALLET, pending);
+    if (state === "receipt")
+      await appendReceipt(
+        {
+          id: pending.receiptId,
+          timestamp: now.toISOString(),
+          wallet: WALLET,
+          resourceUrl: "https://console.example/api/router/top-up/5",
+          method: "POST",
+          outcome: "paid",
+          settlement: { outcome: "succeeded", transaction: `0x${"33".repeat(32)}` },
+        },
+        getVapiPaths(home).receipts,
+        { wallet: WALLET },
+      );
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const body = (await request.json()) as {
+        id: number;
+        method: string;
+        params: [{ to: string; data: string }];
+      };
+      expect(body.method).toBe("eth_call");
+      expect(body.params[0].to).toBe(pending.authorization!.token);
+      expect(body.params[0].data).toContain(pending.authorization!.nonce.slice(2));
+      if (state === "rpc-error") throw new Error("RPC unavailable");
+      return Response.json({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: `0x${(state === "used" ? "1" : "0").padStart(64, "0")}`,
+      });
+    });
+    const captured = captureIo();
+    const exit = await runCli(
+      ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+      captured.io,
+      commandDependencies({ fetchImpl, now: () => now }),
+    );
+    const refuses = ["receipt", "settled", "used", "live", "margin"].includes(state);
+    expect(exit).toBe(refuses ? 1 : 0);
+    expect(fetchImpl).toHaveBeenCalledTimes(
+      ["used", "live", "margin", "expired", "rpc-error"].includes(state) ? 1 : 0,
+    );
+    const retained = (await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase;
+    expect(retained?.receiptId).toBe(refuses ? pending.receiptId : undefined);
+    expect(captured.stdout).toHaveLength(1);
+    const output = JSON.parse(captured.stdout[0]!);
+    if (["receipt", "settled", "used"].includes(state))
+      expect(output.error).toMatch(/payment settled.*retry chat.*key/iu);
+    if (state === "live" || state === "margin")
+      expect(output.error).toContain(new Date((validBefore + 31) * 1000).toISOString());
+    if (state === "rpc-error" || state === "unsupported")
+      expect(output.confirmation).toMatch(/human confirmed.*without chain evidence/iu);
+    else if (!refuses) expect(output.confirmation).toBeUndefined();
+  });
+
+  it("emits only one JSON error when the confirmed clear cannot be persisted", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    await store.setRouterPendingPurchase(WALLET, {
+      receiptId: "clear-write-failure",
+      status: "unknown",
+      createdAt: "2026-09-23T10:00:00.000Z",
+      tierUsd: 5,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "client",
+        owner: "0x1111111111111111111111111111111111111111",
+        label: "test",
+        scopes: [],
+        linkedAt: "2026-09-23T10:00:00.000Z",
+      },
+    });
+    const failure = vi
+      .spyOn(WalletStore.prototype, "setRouterPendingPurchase")
+      .mockRejectedValue(new Error("pending file is read-only"));
+    try {
+      const captured = captureIo();
+      expect(
+        await runCli(
+          ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+          captured.io,
+          commandDependencies(),
+        ),
+      ).toBe(1);
+      expect(captured.stdout).toHaveLength(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        error: "pending file is read-only",
+        exitCode: 1,
+      });
+    } finally {
+      failure.mockRestore();
+    }
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase?.receiptId).toBe(
+      "clear-write-failure",
+    );
+  });
+
+  it("prints public evidence without clearing, then requires explicit unpaid confirmation", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home);
+    const pending = {
+      receiptId: "manual-recovery",
+      status: "unknown" as const,
+      createdAt: "2026-09-23T10:00:00.000Z",
+      tierUsd: 5 as const,
+      link: {
+        apiBase: "https://console.example",
+        clientId: "public-client",
+        owner: `0x${"11".repeat(20)}` as const,
+        label: "test",
+        scopes: [],
+        linkedAt: "2026-09-23T10:00:00.000Z",
+      },
+      network: "eip155:8453",
+      authorization: {
+        token: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        from: `0x${"11".repeat(20)}`,
+        nonce: `0x${"ab".repeat(32)}`,
+        validBefore: "1790157600",
+      },
+    };
+    await store.setRouterPendingPurchase(WALLET, pending);
+    const human = captureIo();
+    const dependencies = commandDependencies({
+      fetchImpl: vi.fn<typeof fetch>().mockRejectedValue(new Error("RPC offline")),
+    });
+    expect(
+      await runCli(["router", "clear-pending", "--account", WALLET], human.io, dependencies),
+    ).toBe(0);
+    expect(human.stdout.join("\n")).toContain(pending.authorization.nonce);
+    expect(human.stdout.join("\n")).toContain("https://basescan.org/address/");
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase).toEqual(pending);
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "clear-pending", "--confirm-unpaid", "--account", WALLET, "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      wallet: WALLET,
+      cleared: true,
+      pending: {
+        receiptId: pending.receiptId,
+        authorization: pending.authorization,
+        instructions: expect.stringContaining("authorizationState"),
+      },
+    });
+    expect((await WalletStore.open(home)).entry(WALLET)?.routerPendingPurchase).toBeUndefined();
   });
 });
 
@@ -103,6 +318,107 @@ describe("vapi router usage", () => {
 });
 
 describe("vapi router buy", () => {
+  it.each(["audit", "key", "balance"] as const)(
+    "returns success through real payment when %s follow-up fails",
+    async (failure) => {
+      const dependencies = await linkedRouterDependencies(
+        async (input, init) => await transport.fetchImpl(input, init),
+      );
+      const home = process.env.VAPI_HOME!;
+      const transport = purchaseTransport(home, failure);
+      await writeFile(
+        join(home, "config.json"),
+        JSON.stringify({ ...getDefaultConfig({}), allowPrivateNetwork: true }),
+      );
+      const store = await WalletStore.open(home, { secrets: currentSecretStore() });
+      await store.setSpendCaps(WALLET, { perCallAtomic: "5000000", perDayAtomic: "20000000" });
+      const captured = captureIo();
+      expect(
+        await runCli(
+          ["router", "buy", "5", "--wallet", WALLET, "--json"],
+          captured.io,
+          dependencies,
+        ),
+      ).toBe(0);
+      expect(transport.calls.paid).toBe(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        receipt: { amountUsd: 4.75, id: expect.any(String) },
+        warnings: [
+          {
+            code:
+              failure === "audit"
+                ? "audit_unavailable"
+                : failure === "key"
+                  ? "router_key_unavailable"
+                  : "balance_unavailable",
+          },
+        ],
+      });
+      expect(allOutput(captured)).not.toContain("private-follow-up-error-must-not-leak");
+    },
+  );
+
+  it.each([
+    {
+      label: "the charged quote rather than the requested tier",
+      quote: { network: "eip155:5042", amountAtomic: "4750000" },
+      evidence: { network: "eip155:8453" },
+      amountUsd: 4.75,
+      network: "eip155:5042",
+    },
+    {
+      label: "settlement evidence when the quote is absent",
+      quote: undefined,
+      evidence: { network: "eip155:5042" },
+      amountUsd: null,
+      network: "eip155:5042",
+    },
+    {
+      label: "unknown values when payment metadata is absent",
+      quote: undefined,
+      evidence: undefined,
+      amountUsd: null,
+      network: "unknown",
+    },
+  ])(
+    "reports $label after a successful purchase",
+    async ({ quote, evidence, amountUsd, network }) => {
+      await initializedHome();
+      const receipt: Receipt = {
+        ...purchaseResult().receipt,
+        quote,
+        settlement: { outcome: "succeeded", transaction: "0xtransaction", evidence },
+      };
+      const buy = vi.fn<typeof buyRouterBalance>(async () => ({ receipt, balance: null }));
+      const dependencies = {
+        ...commandDependencies(),
+        router: { buyRouterBalance: buy },
+      };
+      const captured = captureIo();
+
+      expect(
+        await runCli(
+          ["router", "buy", "5", "--wallet", WALLET, "--json"],
+          captured.io,
+          dependencies,
+        ),
+      ).toBe(0);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        receipt: { amountUsd, network },
+        tierUsd: 5,
+      });
+      expect(buy).toHaveBeenCalledTimes(1);
+
+      const human = captureIo();
+      expect(await runCli(["router", "buy", "5", "--wallet", WALLET], human.io, dependencies)).toBe(
+        0,
+      );
+      expect(human.stdout.join("\n")).toContain(
+        amountUsd === null ? "charged amount unknown" : "Paid $4.75 USDC",
+      );
+    },
+  );
+
   it("unlocks the wallet, applies its spend caps, and prints the paid balance", async () => {
     await initializedHome();
     const buy = vi.fn<typeof buyRouterBalance>(async () => purchaseResult());
@@ -117,7 +433,11 @@ describe("vapi router buy", () => {
         router: { buyRouterBalance: buy },
       }),
     ).toBe(0);
-    expect(captured.stdout).toEqual(["Paid $5.00 USDC on Base. Router balance: $7.40."]);
+    expect(captured.stdout).toEqual([
+      "Paid $5.00 USDC on Base. Router balance: $7.40.",
+      "Receipt: router-receipt",
+      "Transaction: 0xtransaction",
+    ]);
     expect(secret).not.toHaveBeenCalled();
     expect(buy).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -130,6 +450,8 @@ describe("vapi router buy", () => {
       }),
       5,
     );
+    expect(allOutput(captured)).toContain("router-receipt");
+    expect(allOutput(captured)).toContain("0xtransaction");
   });
 
   it("prints a secret-free JSON summary and handles a not-yet-visible balance", async () => {
@@ -148,10 +470,12 @@ describe("vapi router buy", () => {
     ).toBe(0);
     expect(JSON.parse(json.stdout[0]!)).toEqual({
       tierUsd: 5,
-      amountUsd: 5,
-      network: "eip155:8453",
-      transaction: "0xtransaction",
-      receiptId: "router-receipt",
+      receipt: {
+        amountUsd: 5,
+        network: "eip155:8453",
+        transaction: "0xtransaction",
+        id: "router-receipt",
+      },
       balance: null,
     });
     expect(allOutput(json)).not.toContain(TEST_ROUTER_KEY);
@@ -160,7 +484,11 @@ describe("vapi router buy", () => {
     expect(await runCli(["router", "buy", "5", "--wallet", WALLET], human.io, dependencies)).toBe(
       0,
     );
-    expect(human.stdout).toEqual(["Paid $5.00 USDC on Base. Router balance is not visible yet."]);
+    expect(human.stdout).toEqual([
+      "Paid $5.00 USDC on Base. Router balance is not visible yet.",
+      "Receipt: router-receipt",
+      "Transaction: 0xtransaction",
+    ]);
   });
 
   it("stores and clears automatic refill without unlocking the wallet", async () => {
@@ -271,6 +599,118 @@ describe("vapi router buy", () => {
 });
 
 describe("vapi router chat", () => {
+  it("does not unlock the payment account for a credential-only retry", async () => {
+    const home = await initializedHome();
+    const store = await WalletStore.open(home, { secrets: currentSecretStore() });
+    await store.setRouterRefill(WALLET, { tierUsd: 5, belowUsd: 2 });
+    const unlock = vi.spyOn(WalletStore.prototype, "unlock");
+    try {
+      const result = await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "retry"],
+        captureIo().io,
+        commandDependencies({ router: { routerChat: async () => chatResult() } }),
+      );
+      expect(result).toBe(0);
+      expect(unlock).not.toHaveBeenCalled();
+    } finally {
+      unlock.mockRestore();
+    }
+  });
+
+  it("preserves settled refill evidence in chat errors and payment-aware guidance", async () => {
+    await initializedHome();
+    const purchase = {
+      ...purchaseResult(null),
+      warnings: [{ code: "router_key_unavailable" as const, message: "Key recovery is pending." }],
+    };
+    const message =
+      "Payment settled, but the Router balance key is not yet available. It will be fetched on the next request.";
+    const dependencies = commandDependencies({
+      router: {
+        routerChat: async () => {
+          throw new RouterClientError("refill_pending", message, undefined, purchase);
+        },
+      },
+    });
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi", "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(1);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      error: message,
+      code: "refill_pending",
+      exitCode: 1,
+      refill: {
+        receipt: { id: "router-receipt", amountUsd: 5 },
+        balance: null,
+        warnings: purchase.warnings,
+      },
+    });
+    const human = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi"],
+        human.io,
+        dependencies,
+      ),
+    ).toBe(1);
+    expect(human.stderr).toContain(message);
+    expect(human.stderr.join("\n")).toContain("router-receipt");
+    expect(human.stderr.join("\n")).toContain("0xtransaction");
+  });
+
+  it("keeps auto-refill warnings in chat JSON and human diagnostics", async () => {
+    await initializedHome();
+    const refill = {
+      ...purchaseResult(null),
+      warnings: [
+        {
+          code: "balance_unavailable" as const,
+          message: "Payment succeeded; balance unavailable.",
+        },
+      ],
+    };
+    const dependencies = commandDependencies({
+      router: { routerChat: async () => ({ ...chatResult(), refill }) },
+    });
+    const json = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi", "--json"],
+        json.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(JSON.parse(json.stdout[0]!)).toMatchObject({
+      content: "Done.",
+      refill: {
+        receipt: {
+          id: "router-receipt",
+          amountUsd: 5,
+          network: "eip155:8453",
+          transaction: "0xtransaction",
+        },
+        balance: null,
+        warnings: refill.warnings,
+      },
+    });
+    const human = captureIo();
+    expect(
+      await runCli(
+        ["router", "chat", "--wallet", WALLET, "--model", "model-a", "hi"],
+        human.io,
+        dependencies,
+      ),
+    ).toBe(0);
+    expect(human.stderr).toContain(refill.warnings[0]!.message);
+    expect(allOutput(human)).toContain("router-receipt");
+    expect(allOutput(human)).toContain("0xtransaction");
+  });
+
   it("builds system and user messages and prints human and JSON results", async () => {
     await initializedHome();
     const result: ChatResult = {
@@ -588,7 +1028,7 @@ describe("Router client errors", () => {
 
     expect(await runCli(["router", "--json"], captured.io, commandDependencies())).toBe(2);
     expect(JSON.parse(captured.stdout[0]!)).toEqual({
-      error: "Usage: vapi router <models|usage|chat|key|buy>.",
+      error: "Usage: vapi router <models|usage|chat|key|buy|clear-pending>.",
       exitCode: 2,
     });
   });

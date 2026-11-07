@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 import type { Address } from "viem";
+import { RouterClientError } from "@vapi-network/core/router-client";
 
 import {
   BASE_MAINNET_CAIP2,
@@ -264,6 +265,7 @@ Usage:
   vapi router buy --auto <1|5|20|50> --below <usd> [--account <name>] [--json]
   vapi router buy --auto off [--account <name>] [--json]
   vapi router key [--rotate] [--account <name>] [--json]
+  vapi router clear-pending [--confirm-unpaid] [--account <name>] [--json]
   vapi stake status [--account <name>] [--json]
   vapi stake open [--account <name>] [--no-browser] [--json]
   vapi task search [--open] [--min <usd>] [--tab trending|new|closing|paid] [--limit <n>] [--json]
@@ -1006,6 +1008,9 @@ export async function runCli(
             (error instanceof SwarmError && error.code === "swarm_workers_active")
               ? { code: error.code }
               : {}),
+            ...(error instanceof RouterClientError && error.refill !== undefined
+              ? { code: error.code, refill: error.toJSON().refill }
+              : {}),
             ...(error instanceof VapiCallError ? { code: error.code } : {}),
             ...(error instanceof DocsError ? { code: error.code } : {}),
             ...(error instanceof RemoteKeyRefusedError ? { code: error.code } : {}),
@@ -1025,6 +1030,11 @@ export async function runCli(
           ? `${errorCode}: ${message}`
           : message,
       );
+      if (error instanceof RouterClientError && error.refill !== undefined) {
+        const receipt = error.toJSON().refill!.receipt;
+        runIo.stderr(`Receipt: ${receipt.id}`);
+        if (receipt.transaction !== undefined) runIo.stderr(`Transaction: ${receipt.transaction}`);
+      }
     }
     if (shouldAutoUploadAfterFailure(argv.filter((argument) => argument !== "--json"))) {
       await autoUploadBackup(io, json, dependencies);

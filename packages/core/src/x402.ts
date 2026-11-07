@@ -131,6 +131,14 @@ export type X402Signer = {
   solana?: ConstructorParameters<typeof ExactSvmScheme>[0];
 };
 
+/** Durable public evidence recorded before any signature can exist. */
+export type X402SigningEvidence = {
+  network: string;
+  token: string;
+  amountAtomic: string;
+  authorization?: Eip3009Authorization;
+};
+
 export type X402PaymentPayload = {
   x402Version: 2;
   resource: X402Resource;
@@ -573,6 +581,7 @@ export async function buildX402Payment(args: {
   nonce?: Hex;
   fetchImpl?: typeof fetch;
   paymentId?: string;
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
 }): Promise<{
   payload: X402PaymentPayload;
   headers: X402PaymentHeaders;
@@ -598,6 +607,11 @@ export async function buildX402Payment(args: {
       args.quote.accepted.network === SOLANA_MAINNET_CAIP2
         ? { ...args.quote.accepted, network: X402_SOLANA_MAINNET_CAIP2 }
         : args.quote.accepted;
+    await args.beforeSign?.({
+      network: args.quote.accepted.network,
+      token: args.quote.accepted.asset,
+      amountAtomic: args.quote.amountAtomic.toString(),
+    });
     const created = await withGuardedSvmFetch(
       args.fetchImpl ?? createPublicFetch({ allowPrivateNetwork: false }),
       async () => {
@@ -631,6 +645,12 @@ export async function buildX402Payment(args: {
       ? {}
       : { maximumValidBeforeSeconds: args.maximumValidBeforeSeconds }),
   });
+  await args.beforeSign?.({
+    network: args.quote.accepted.network,
+    token: args.quote.accepted.asset,
+    amountAtomic: args.quote.amountAtomic.toString(),
+    authorization,
+  });
   const signature = await args.signer.signTypedData(typedData);
   const payload: X402PaymentPayload = {
     x402Version: 2,
@@ -657,6 +677,7 @@ export async function buildCompatibleX402Payment(args: {
   nonce?: Hex;
   fetchImpl?: typeof fetch;
   paymentId?: string;
+  beforeSign?: (evidence: X402SigningEvidence) => Promise<void>;
 }): Promise<{
   payload: X402PaymentPayload;
   headers: X402CompatiblePaymentHeaders;
@@ -670,6 +691,7 @@ export async function buildCompatibleX402Payment(args: {
       ? {}
       : { maximumValidBeforeSeconds: args.maximumValidBeforeSeconds }),
     ...(args.nonce === undefined ? {} : { nonce: args.nonce }),
+    ...(args.beforeSign === undefined ? {} : { beforeSign: args.beforeSign }),
     ...(args.fetchImpl === undefined ? {} : { fetchImpl: args.fetchImpl }),
     ...(args.paymentId === undefined ? {} : { paymentId: args.paymentId }),
   });
